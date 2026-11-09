@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""
+Extended benchmark with full RLG error budget + 1D sweeps + 10 estimators.
+
+Estimators (10, spanning 4 families):
+  Kalman     : KF, EKF, UKF, Huber KF
+  Gradient   : SGD (covariance-free observer), RLS
+  Signal-proc: AR(2) two-stage pipeline, I/Q+OLS fusion
+  Fixed-gain : alpha-beta, Complementary
+
+Simulation adds to baseline (ARW-only):
+  - Bias instability (OU process on rate)
+  - Rate random walk (drift on rate)
+  - Scale-factor nonlinearity (quadratic in rate)
+  - Temperature drift (affects OmegaL and bias continuously)
+
+Produces 1D sweeps:
+  - ARW sweep
+  - Contamination sweep
+  - Temperature sweep
+
+Hyperparameters tuned on 'realistic_full' across 3 train seeds, then
+held fixed across all 1D sweeps (sweeps measure sensitivity, not retuning).
+
+Runtime: ~20 min on Kaggle CPU.
+"""
+import numpy as np
+import time
+from scipy.stats import t as student_t
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    HAVE_MPL = True
+except ImportError:
+    HAVE_MPL = False
+    print("WARNING: matplotlib not installed. Sweep plots will be skipped.")
+
+# ============================================================
+# Configuration
+# ============================================================
+TRAIN_SEEDS = [1, 2, 3]
+TEST_SEEDS  = [11, 12, 13, 21, 22, 23, 24]
+TE = np.arange(40.0, 200.0, 1.0)
+SCENARIO_REALISTIC = 'realistic_full'
+
+ESTIMATORS = ['KF', 'SGD', 'RLS', 'Huber KF', 'alpha-beta',
+              'Complementary', 'EKF', 'UKF', 'AR(2)', 'I/Q+OLS']
+
+PALETTE = {
+    'KF':            ('black',       'o'),
+    'SGD':           ('red',         's'),
+    'RLS':           ('royalblue',   '^'),
+    'Huber KF':      ('green',       'D'),
+    'alpha-beta':    ('orange',      'v'),
+    'Complementary': ('purple',      'P'),
+    'EKF':           ('saddlebrown', 'X'),
+    'UKF':           ('darkviolet',  '*'),
+    'AR(2)':         ('teal',        'h'),
+    'I/Q+OLS':       ('darkorange',  '8'),
+}
+
+
+# ============================================================
+# Extended data generation
+# ============================================================
+def make_data(scenario, seed=11, T=200.0, R=16, DT=0.01,
+              arw=0.03,
+              bias_inst=0.0,
+              bias_inst_tau=100.0,
+              rrw=0.0,
+              sf_nonlin=0.0,
+              temp_amp=0.0,
+              temp_period=80.0,
+              temp_oml_gain=0.1,
+              temp_bias_gain=0.005):
+    """
+    Full RLG error-budget data generation.
+    dpsi/dt = Omega(t) + bias(t) + rrw(t) + probe - OmegaL_eff(t)*sin(psi)
+    y_meas  = signal_rate * (1 + sf_nonlin * signal_rate)
+    psi    += raw_rate*DT + arw*sqrt(DT)*N(0,1)
+    """
+    rng = np.random.default_rng(seed)
+    nt = int(T / DT)
+    omega_fn = lambda t: 0.3 + 0.1 * np.sin(2 * np.pi * t / 100)
+    psi = rng.uniform(-np.pi, np.pi, R)
+    S = np.zeros((nt, R)); Y = np.zeros((nt, R))
+
+    # OmegaL baseline dynamics
+    if scenario == 'diffusion':
+        oml_rw = np.clip(1.0 + np.cumsum(rng.standard_normal(nt) * 0.001), 0.5, 3.0)
+        def oml_of(k): return np.full(R, oml_rw[k])
+    else:
+        def oml_of(k): return np.full(R, 1.0 if k * DT < 60 else 2.0)
+
+    # Contamination
+    if scenario == 'extreme_outliers_2pct':
+        contam = rng.random((nt, R)) < 0.02
+        contam_mag = rng.choice([-5.0, 5.0], size=(nt, R))
+    elif scenario == 'extreme_outliers_5pct':
+        contam = rng.random((nt, R)) < 0.05
+        contam_mag = rng.choice([-10.0, 10.0], size=(nt, R))
+    else:
+        contam = np.zeros((nt, R), dtype=bool)
+        contam_mag = np.zeros((nt, R))
+
+    # OU bias instability
+    if bias_inst > 0:
+        rho = np.exp(-DT / bias_inst_tau)
+        sigma_ou = bias_inst * np.sqrt(1 - rho**2)
+    else:
+        rho = 1.0
+        sigma_ou = 0.0
+
+    bias = np.zeros((nt, R))
+    rrw_state = np.zeros((nt, R))
+    T_state = np.zeros((nt, R))
+    T_0 = 20.0
+
+    for k in range(nt):
+        t = k * DT
+        probe = np.sin(2 * np.pi * t / 5)
+        oml_base = oml_of(k)
+
+        if k > 0:
+            if bias_inst > 0:
+                bias[k] = rho * bias[k-1] + sigma_ou * rng.standard_normal(R)
+            if rrw > 0:
+                rrw_state[k] = rrw_state[k-1] + rrw * np.sqrt(DT) * rng.standard_normal(R)
+
+        T_state[k] = T_0 + temp_amp * np.sin(2 * np.pi * t / temp_period)
+        dT = T_state[k] - T_0
+
+        oml_eff = oml_base * (1 + temp_oml_gain * dT)
+        bias_eff = bias[k] + temp_bias_gain * dT
+
+        s = np.sin(psi)
+        raw_rate = omega_fn(t) + bias_eff + rrw_state[k] + probe - oml_eff * s
+        signal_rate = omega_fn(t) + bias_eff + rrw_state[k] - oml_eff * s
+        y_meas = signal_rate * (1 + sf_nonlin * signal_rate)
+
+        noise = arw * np.sqrt(DT) * rng.standard_normal(R)
+        if contam.any():
+            noise = noise + contam[k] * contam_mag[k] * arw * np.sqrt(DT)
+
+        dpsi = raw_rate * DT + noise
+        S[k] = s
+        Y[k] = y_meas
+        psi = psi + dpsi
+
+    return S, Y, omega_fn, oml_of, DT
+
+
+def make_realistic(seed=11):
+    """Realistic scenario: all error sources active at typical ratios."""
+    return make_data('piecewise', seed=seed,
+                     arw=0.03,
+                     bias_inst=0.003, bias_inst_tau=100.0,
+                     rrw=0.0003, sf_nonlin=0.02,
+                     temp_amp=1.0, temp_period=80.0,
+                     temp_oml_gain=0.1, temp_bias_gain=0.005)
+
+
+# ============================================================
+# Estimators
+# ============================================================
+def run_kf(S, Y, dt, q_o=1e-6, q_l=1e-6, r=0.09):
+    nt, R = Y.shape
+    th = np.tile([0.3, 1.0], (R, 1))
+    P  = np.tile(np.diag([0.01, 0.25]), (R, 1, 1))
+    est = np.zeros((nt, R))
+    for k in range(nt):
+        H  = np.stack([np.ones(R), -S[k]], axis=1)
+        P  = P + np.diag([q_o, q_l])
+        PH = P @ H[:, :, None]
+        Sv = (H[:, None, :] @ PH).squeeze(-1) + r
+        K  = PH / Sv[:, None, :]
+        innov = Y[k] - (H * th).sum(1)
+        th = th + (K @ innov[:, None, None]).squeeze(-1)
+        P  = P - K @ (H[:, None, :] @ P)
+        est[k] = th[:, 0]
+    return est
+
+
+def run_sgd(S, Y, dt, lr=0.3, k_i=0.01):
+    nt, R = Y.shape
+    E = Y[0].copy(); oml = np.full(R, 1.0); est = np.zeros((nt, R))
+    for k in range(nt):
+        P = (Y[k] + oml * S[k]) - E
+        E = E + k_i * P
+        oml = np.clip(oml - lr * P * S[k], 0.5, 3.0)
+        est[k] = E
+    return est
+
+
+def run_rls(S, Y, dt, lam=0.995):
+    nt, R = Y.shape
+    th = np.tile([0.3, 1.0], (R, 1))
+    P  = np.tile(np.eye(2) * 100.0, (R, 1, 1))
+    est = np.zeros((nt, R))
+    for k in range(nt):
+        H  = np.stack([np.ones(R), -S[k]], axis=1)
+        PH = (P @ H[:, :, None]).squeeze(-1)
+        denom = lam + (H * PH).sum(1)
+        K  = PH / denom[:, None]
+        innov = Y[k] - (H * th).sum(1)
+        th = th + K * innov[:, None]
+        P  = (P - K[:, :, None] * PH[:, None, :]) / lam
+        est[k] = th[:, 0]
+    return est
+
+
+def run_huber_kf(S, Y, dt, q_o=1e-6, q_l=1e-6, r=0.09, thr=1.345):
+    nt, R = Y.shape
+    th = np.tile([0.3, 1.0], (R, 1))
+    P  = np.tile(np.diag([0.01, 0.25]), (R, 1, 1))
+    est = np.zeros((nt, R))
+    for k in range(nt):
+        H  = np.stack([np.ones(R), -S[k]], axis=1)
+        P  = P + np.diag([q_o, q_l])
+        PH = (P @ H[:, :, None]).squeeze(-1)
+        Sv = (H * PH).sum(1) + r
+        sig = np.sqrt(Sv)
+        innov = Y[k] - (H * th).sum(1)
+        z = np.abs(innov) / sig
+        w = np.ones(R)
+        mask = z > thr
+        w[mask] = thr / z[mask]
+        r_eff  = r / np.maximum(w, 1e-6)
+        Sv_eff = (H * PH).sum(1) + r_eff
+        K = PH / Sv_eff[:, None]
+        th = th + K * innov[:, None]
+        P  = P - K[:, :, None] * PH[:, None, :]
+        est[k] = th[:, 0]
+    return est
+
+
+def run_alpha_beta(S, Y, dt, alpha=0.1, beta=0.005, oml_nom=1.5):
+    nt, R = Y.shape
+    x = Y[0].copy(); v = np.zeros(R); est = np.zeros((nt, R))
+    for k in range(nt):
+        xp = x + v * dt
+        y_meas = Y[k] + oml_nom * S[k]
+        innov = y_meas - xp
+        x = xp + alpha * innov
+        v = v + (beta / dt) * innov
+        est[k] = x
+    return est
+
+
+def run_complementary(S, Y, dt, alpha=0.01, oml_nom=1.5):
+    nt, R = Y.shape
+    x = Y[0].copy(); est = np.zeros((nt, R))
+    for k in range(nt):
+        y_meas = Y[k] + oml_nom * S[k]
+        x = alpha * y_meas + (1 - alpha) * x
+        est[k] = x
+    return est
+
+
+def run_ekf(S, Y, dt, q_o=1e-6, q_l=1e-6, r_y=0.09, r_s=0.01):
+    nt, R = Y.shape
+    x = np.column_stack([np.full(R, 0.3), np.full(R, 1.0),
+                         np.arcsin(np.clip(S[0], -1, 1))])
+    P = np.tile(np.diag([0.01, 0.25, 1.0]), (R, 1, 1))
+    Q  = np.diag([q_o, q_l, 1e-3])
+    Rm = np.diag([r_y, r_s])
+    est = np.zeros((nt, R))
+    for k in range(nt):
+        s_p = np.sin(x[:, 2])
+        psi_p = x[:, 2] + dt * (x[:, 0] - x[:, 1] * s_p)
+        xp = np.column_stack([x[:, 0], x[:, 1], psi_p])
+        c_p = np.cos(x[:, 2])
+        F = np.zeros((R, 3, 3))
+        F[:, 0, 0] = 1.0; F[:, 1, 1] = 1.0
+        F[:, 2, 0] = dt;  F[:, 2, 1] = -dt * s_p
+        F[:, 2, 2] = 1.0 - dt * x[:, 1] * c_p
+        Pp = F @ P @ F.transpose(0, 2, 1) + Q
+        sp = np.sin(psi_p); cp = np.cos(psi_p)
+        h = np.column_stack([xp[:, 0] - xp[:, 1] * sp, sp])
+        H = np.zeros((R, 2, 3))
+        H[:, 0, 0] = 1.0; H[:, 0, 1] = -sp; H[:, 0, 2] = -xp[:, 1] * cp
+        H[:, 1, 2] = cp
+        z  = np.column_stack([Y[k], S[k]])
+        nu = z - h
+        PH = Pp @ H.transpose(0, 2, 1)
+        Si = H @ PH + Rm + 1e-9 * np.eye(2)
+        K  = PH @ np.linalg.inv(Si)
+        x  = xp + (K @ nu[:, :, None]).squeeze(-1)
+        P  = (np.eye(3) - K @ H) @ Pp
+        est[k] = x[:, 0]
+    return est
+
+
+def run_ukf(S, Y, dt, q_o=1e-6, q_l=1e-6, r_y=0.09, r_s=0.01):
+    nt, R = Y.shape
+    n = 3
+    alpha, beta, kappa = 1e-3, 2.0, 0.0
+    lam = alpha**2 * (n + kappa) - n
+    Wm = np.full(2*n+1, 0.5/(n+lam))
+    Wc = Wm.copy()
+    Wm[0] = lam/(n+lam); Wc[0] = Wm[0] + (1 - alpha**2 + beta)
+
+    x = np.column_stack([np.full(R, 0.3), np.full(R, 1.0),
+                         np.arcsin(np.clip(S[0], -1, 1))])
+    P = np.tile(np.diag([0.01, 0.25, 1.0]), (R, 1, 1))
+    Q  = np.diag([q_o, q_l, 1e-3])
+    Rm = np.diag([r_y, r_s])
+    est = np.zeros((nt, R))
+
+    def f_batch(st):
+        s = np.sin(st[:, :, 2])
+        psi = st[:, :, 2] + dt * (st[:, :, 0] - st[:, :, 1] * s)
+        return np.stack([st[:, :, 0], st[:, :, 1], psi], axis=-1)
+
+    def h_batch(st):
+        s = np.sin(st[:, :, 2])
+        return np.stack([st[:, :, 0] - st[:, :, 1] * s, s], axis=-1)
+
+    for k in range(nt):
+        M = (n + lam) * P + 1e-9 * np.eye(3)
+        try:
+            L = np.linalg.cholesky(M)
+        except np.linalg.LinAlgError:
+            L = np.tile(np.eye(3) * 1e-3, (R, 1, 1))
+        sig = np.zeros((R, 2*n+1, n))
+        sig[:, 0] = x
+        for i in range(n):
+            sig[:, 1+i]   = x + L[:, :, i]
+            sig[:, 1+n+i] = x - L[:, :, i]
+        sig_f = f_batch(sig)
+        xp = (Wm[None, :, None] * sig_f).sum(1)
+        d  = sig_f - xp[:, None, :]
+        Pp = np.einsum('i,nij,nik->njk', Wc, d, d) + Q
+        Z  = h_batch(sig_f)
+        zp = (Wm[None, :, None] * Z).sum(1)
+        dz = Z - zp[:, None, :]
+        Szz = np.einsum('i,nij,nik->njk', Wc, dz, dz) + Rm
+        Sxz = np.einsum('i,nij,nik->njk', Wc, d, dz)
+        K = Sxz @ np.linalg.inv(Szz + 1e-9 * np.eye(2))
+        z_obs = np.column_stack([Y[k], S[k]])
+        x = xp + (K @ (z_obs - zp)[:, :, None]).squeeze(-1)
+        P = Pp - K @ Szz @ K.transpose(0, 2, 1)
+        est[k] = x[:, 0]
+    return est
+
+
+def run_ar2(S, Y, dt, lam=0.99, lp=0.02):
+    """
+    AR(2) frequency tracker + low-pass state smoother.
+
+    Stage 1: AR(2) on S = sin(psi). Fits a1, a2 via exponentially-weighted
+             RLS. Recovers w = dpsi/dt from the complex pole angle.
+    Stage 2: Omega_hat ~ low-pass(w - probe).
+    """
+    nt, R = Y.shape
+    a1 = np.zeros(R); a2 = np.zeros(R)
+    P_ar = np.tile(np.eye(2) * 100.0, (R, 1, 1))
+    S_p1 = S[0].copy(); S_p2 = S[0].copy()
+    w_psi = np.zeros((nt, R))
+    for k in range(1, nt):
+        s = S[k]
+        x = np.stack([S_p1, S_p2], axis=1)
+        Px = (P_ar @ x[:, :, None]).squeeze(-1)
+        denom = lam + (x * Px).sum(1)
+        K = Px / denom[:, None]
+        pred = (x * np.stack([a1, a2], axis=1)).sum(1)
+        innov = s - pred
+        a1 = a1 + K[:, 0] * innov
+        a2 = a2 + K[:, 1] * innov
+        P_ar = (P_ar - K[:, :, None] * Px[:, None, :]) / lam
+        r = np.sqrt(np.maximum(-a2, 1e-12))
+        theta = np.arccos(np.clip(a1 / (2 * r + 1e-12), -1, 1))
+        w_psi[k] = theta / dt
+        S_p2 = S_p1; S_p1 = s
+
+    est = np.zeros((nt, R))
+    omega_hat = w_psi[1] - np.sin(2 * np.pi * dt / 5)
+    for k in range(1, nt):
+        probe = np.sin(2 * np.pi * (k * dt) / 5)
+        omega_meas = w_psi[k] - probe
+        omega_hat = omega_hat + lp * (omega_meas - omega_hat)
+        est[k] = omega_hat
+    return est
+
+
+def run_iq_ols(S, Y, dt, lam=0.99, tau_q=0.1):
+    """
+    I/Q + OLS fusion: fuse Y (in-phase) and a delayed-Q proxy.
+    Q is constructed via a first-order all-pass filter (tau_q).
+    Running-variance OLS weights then gradient tracking of the fused signal.
+    """
+    nt, R = Y.shape
+    alpha_q = (dt - tau_q) / (dt + tau_q)
+    q = np.zeros((nt, R))
+    q[0] = Y[0]
+    for k in range(1, nt):
+        q[k] = alpha_q * (q[k-1] + Y[k] - Y[k-1])
+
+    var_i = np.var(Y[:50], axis=0) + 1e-12
+    var_q = np.var(q[:50], axis=0) + 1e-12
+    freq = Y[0].copy()
+    est = np.zeros((nt, R))
+    est[0] = freq
+    for k in range(1, nt):
+        var_i = lam * var_i + (1 - lam) * Y[k]**2
+        var_q = lam * var_q + (1 - lam) * q[k]**2
+        w = var_q / (var_i + var_q + 1e-12)
+        fused = w * Y[k] + (1 - w) * q[k]
+        freq = freq + 0.05 * (fused - freq)
+        est[k] = freq
+    return est
+
+
+def run_by_name(name, params, S, Y, dt):
+    return {
+        'KF':           lambda: run_kf(S, Y, dt, **params),
+        'SGD':          lambda: run_sgd(S, Y, dt, **params),
+        'RLS':          lambda: run_rls(S, Y, dt, **params),
+        'Huber KF':     lambda: run_huber_kf(S, Y, dt, **params),
+        'alpha-beta':   lambda: run_alpha_beta(S, Y, dt, **params),
+        'Complementary': lambda: run_complementary(S, Y, dt, **params),
+        'EKF':          lambda: run_ekf(S, Y, dt, **params),
+        'UKF':          lambda: run_ukf(S, Y, dt, **params),
+        'AR(2)':        lambda: run_ar2(S, Y, dt, **params),
+        'I/Q+OLS':      lambda: run_iq_ols(S, Y, dt, **params),
+    }[name]()
+
+
+# ============================================================
+# Utilities
+# ============================================================
+def score(est, omega_fn, te, dt):
+    return np.array([np.abs(est[int(t/dt)-1] - omega_fn(t)) for t in te]).mean(0)
+
+
+def ci_95(d):
+    n = len(d)
+    if n < 2: return f"{d.mean():+.4f} [n/a]"
+    se = d.std(ddof=1) / np.sqrt(n)
+    tc = student_t.ppf(0.975, n - 1)
+    return f"{d.mean():+.4f} [{d.mean()-tc*se:+.4f},{d.mean()+tc*se:+.4f}]"
+
+
+def fmt(v):
+    if isinstance(v, float):
+        if 1e-3 <= abs(v) < 1e3: return f"{v:.3g}"
+        return f"{v:.1e}"
+    return str(v)
+
+
+# ============================================================
+# Tuning (all 10 estimators)
+# ============================================================
+def tune_all(train_maker):
+    train_data = []
+    for ts in TRAIN_SEEDS:
+        S, Y, om, _, dt = train_maker(seed=ts)
+        train_data.append(dict(S=S, Y=Y, omega=om, dt=dt))
+
+    def avg_score(name, params):
+        scores = []
+        for td in train_data:
+            e = run_by_name(name, params, td['S'], td['Y'], td['dt'])
+            scores.append(score(e, td['omega'], TE, td['dt']))
+        return float(np.mean(scores))
+
+    tuned = {}
+
+    # KF: 12 combos
+    best = (np.inf, dict(q_o=1e-6, q_l=1e-6))
+    for q_o in (1e-7, 1e-6, 1e-5):
+        for q_l in (1e-8, 1e-7, 1e-6, 1e-5):
+            p = dict(q_o=q_o, q_l=q_l)
+            m = avg_score('KF', p)
+            if m < best[0]: best = (m, p)
+    tuned['KF'] = best[1]
+    print(f"  KF            {best[1]}  (score={best[0]:.4f})")
+
+    # SGD: 12 combos
+    best = (np.inf, dict(lr=0.3, k_i=0.01))
+    for k_i in (0.001, 0.003, 0.01, 0.03):
+        for lr in (5e-2, 1e-1, 3e-1):
+            p = dict(lr=lr, k_i=k_i)
+            m = avg_score('SGD', p)
+            if m < best[0]: best = (m, p)
+    tuned['SGD'] = best[1]
+    print(f"  SGD           {best[1]}  (score={best[0]:.4f})")
+
+    # RLS: 3 combos
+    best = (np.inf, dict(lam=0.999))
+    for lam in (0.99, 0.995, 0.999):
+        p = dict(lam=lam)
+        m = avg_score('RLS', p)
+        if m < best[0]: best = (m, p)
+    tuned['RLS'] = best[1]
+    print(f"  RLS           {best[1]}  (score={best[0]:.4f})")
+
+    # Huber: 3 combos (reuse KF q)
+    kf_p = tuned['KF']
+    best = (np.inf, dict(q_o=kf_p['q_o'], q_l=kf_p['q_l'], thr=2.0))
+    for thr in (1.0, 1.345, 2.0):
+        p = dict(q_o=kf_p['q_o'], q_l=kf_p['q_l'], thr=thr)
+        m = avg_score('Huber KF', p)
+        if m < best[0]: best = (m, p)
+    tuned['Huber KF'] = best[1]
+    print(f"  Huber KF      {best[1]}  (score={best[0]:.4f})")
+
+    # alpha-beta: 9 combos
+    best = (np.inf, dict(alpha=0.1, beta=0.005))
+    for alpha in (0.05, 0.1, 0.2):
+        for beta in (0.001, 0.005, 0.01):
+            p = dict(alpha=alpha, beta=beta)
+            m = avg_score('alpha-beta', p)
+            if m < best[0]: best = (m, p)
+    tuned['alpha-beta'] = best[1]
+    print(f"  alpha-beta    {best[1]}  (score={best[0]:.4f})")
+
+    # Complementary: 4 combos
+    best = (np.inf, dict(alpha=0.01))
+    for alpha in (0.005, 0.01, 0.02, 0.05):
+        p = dict(alpha=alpha)
+        m = avg_score('Complementary', p)
+        if m < best[0]: best = (m, p)
+    tuned['Complementary'] = best[1]
+    print(f"  Complementary {best[1]}  (score={best[0]:.4f})")
+
+    # EKF, UKF: 3 combos each (reuse KF q)
+    for name in ('EKF', 'UKF'):
+        best = (np.inf, dict(q_o=kf_p['q_o'], q_l=kf_p['q_l'], r_s=0.01))
+        for r_s in (0.01, 0.05, 0.1):
+            p = dict(q_o=kf_p['q_o'], q_l=kf_p['q_l'], r_s=r_s)
+            m = avg_score(name, p)
+            if m < best[0]: best = (m, p)
+        tuned[name] = best[1]
+        print(f"  {name:<13} {best[1]}  (score={best[0]:.4f})")
+
+    # AR(2): 1 param x 4 = 4 combos
+    best = (np.inf, dict(lam=0.99, lp=0.02))
+    for lam in (0.95, 0.98, 0.99, 0.995):
+        p = dict(lam=lam, lp=0.02)
+        m = avg_score('AR(2)', p)
+        if m < best[0]: best = (m, p)
+    tuned['AR(2)'] = best[1]
+    print(f"  AR(2)         {best[1]}  (score={best[0]:.4f})")
+
+    # I/Q+OLS: 2 params x 12 combos
+    best = (np.inf, dict(lam=0.99, tau_q=0.1))
+    for lam in (0.95, 0.98, 0.99, 0.995):
+        for tau_q in (0.05, 0.1, 0.5):
+            p = dict(lam=lam, tau_q=tau_q)
+            m = avg_score('I/Q+OLS', p)
+            if m < best[0]: best = (m, p)
+    tuned['I/Q+OLS'] = best[1]
+    print(f"  I/Q+OLS       {best[1]}  (score={best[0]:.4f})")
+
+    return tuned
+
+
+# ============================================================
+# 1D sweep helper
+# ============================================================
+def sweep_1d(sweep_name, make_at_x, x_values, tuned):
+    print(f"\n{'='*78}\nSweep: {sweep_name}\n{'='*78}")
+    results = {est: [] for est in ESTIMATORS}
+
+    for x in x_values:
+        errs = {est: [] for est in ESTIMATORS}
+        for ts in TEST_SEEDS:
+            S, Y, om, _, dt = make_at_x(x, seed=ts)
+            for est in ESTIMATORS:
+                e = run_by_name(est, tuned[est], S, Y, dt)
+                errs[est].append(score(e, om, TE, dt))
+        for est in ESTIMATORS:
+            results[est].append(np.concatenate(errs[est]).mean())
+
+        line = f"  x={x:8.3g}  "
+        line += "  ".join(f"{e}={results[e][-1]:.4f}"
+                          for e in ['KF','SGD','Huber KF','AR(2)','I/Q+OLS'])
+        print(line)
+
+    return results
+
+
+# ============================================================
+# Main
+# ============================================================
+if __name__ == "__main__":
+    t_start = time.time()
+
+    print("=" * 78)
+    print("Extended benchmark v2: full error budget + 10 estimators + 1D sweeps")
+    print("=" * 78)
+    print(f"  Train seeds: {TRAIN_SEEDS}")
+    print(f"  Test seeds : {TEST_SEEDS}")
+    print(f"  Estimators : {len(ESTIMATORS)}  ({', '.join(ESTIMATORS)})")
+    print(f"  Runtime estimate: ~20 min")
+    print("=" * 78)
+
+    # Step 1: tune
+    print(f"\n{'='*78}\nStep 1: Tuning all 10 estimators on '{SCENARIO_REALISTIC}'\n{'='*78}")
+    t0 = time.time()
+    tuned = tune_all(make_realistic)
+    print(f"  Tuning wall clock: {time.time()-t0:.1f}s")
+
+    # Step 2: baseline table
+    print(f"\n{'='*78}\nStep 2: Baseline table on '{SCENARIO_REALISTIC}'\n{'='*78}")
+    base_errs = {est: [] for est in ESTIMATORS}
+    for ts in TEST_SEEDS:
+        S, Y, om, _, dt = make_realistic(seed=ts)
+        for est in ESTIMATORS:
+            e = run_by_name(est, tuned[est], S, Y, dt)
+            base_errs[est].append(score(e, om, TE, dt))
+
+    print(f"  {'Estimator':<15}{'Mean err':>10}{'95% CI':>28}")
+    print("  " + "-" * 55)
+    for est in ESTIMATORS:
+        errs = np.concatenate(base_errs[est])
+        print(f"  {est:<15}{errs.mean():>10.4f}{ci_95(errs):>28}")
+
+    # Step 3: 1D sweeps
+    # --- Sweep A: ARW level ---
+    def make_arw(arw_val, seed=11):
+        return make_data('piecewise', seed=seed,
+                         arw=arw_val, bias_inst=0.003, bias_inst_tau=100.0,
+                         rrw=0.0003, sf_nonlin=0.02,
+                         temp_amp=1.0, temp_period=80.0,
+                         temp_oml_gain=0.1, temp_bias_gain=0.005)
+
+    arw_values = [0.01, 0.03, 0.05, 0.1, 0.2]
+    sweep_a = sweep_1d('ARW sweep', make_arw, arw_values, tuned)
+
+    # --- Sweep B: contamination fraction ---
+    def make_contam(pct, seed=11):
+        rng = np.random.default_rng(seed)
+        nt = int(200.0 / 0.01)
+        R_ = 16; DT_ = 0.01
+        omega_fn = lambda t: 0.3 + 0.1 * np.sin(2 * np.pi * t / 100)
+        psi = rng.uniform(-np.pi, np.pi, R_)
+        S_ = np.zeros((nt, R_)); Y_ = np.zeros((nt, R_))
+        if pct > 0:
+            cmask = rng.random((nt, R_)) < pct
+            cmag = rng.choice([-5.0, 5.0], size=(nt, R_))
+        else:
+            cmask = np.zeros((nt, R_), dtype=bool)
+            cmag = np.zeros((nt, R_))
+        rho = np.exp(-DT_ / 100.0)
+        sigma_ou = 0.003 * np.sqrt(1 - rho**2)
+        bias = np.zeros((nt, R_)); rrw = np.zeros((nt, R_))
+        for k in range(nt):
+            t = k * DT_
+            probe = np.sin(2 * np.pi * t / 5)
+            oml = 1.0 if t < 60 else 2.0
+            if k > 0:
+                bias[k] = rho * bias[k-1] + sigma_ou * rng.standard_normal(R_)
+                rrw[k]  = rrw[k-1] + 0.0003 * np.sqrt(DT_) * rng.standard_normal(R_)
+            dT = 1.0 * np.sin(2 * np.pi * t / 80.0)
+            oml_eff = oml * (1 + 0.1 * dT)
+            bias_eff = bias[k] + 0.005 * dT
+            s = np.sin(psi)
+            raw    = omega_fn(t) + bias_eff + rrw[k] + probe - oml_eff * s
+            signal = omega_fn(t) + bias_eff + rrw[k] - oml_eff * s
+            y_m = signal * (1 + 0.02 * signal)
+            noise = 0.03 * np.sqrt(DT_) * rng.standard_normal(R_)
+            noise = noise + cmask[k] * cmag[k] * 0.03 * np.sqrt(DT_)
+            dpsi = raw * DT_ + noise
+            S_[k] = s; Y_[k] = y_m; psi = psi + dpsi
+        return S_, Y_, omega_fn, None, DT_
+
+    contam_values = [0.0, 0.01, 0.02, 0.05, 0.10, 0.20]
+    sweep_b = sweep_1d('Contamination sweep', make_contam, contam_values, tuned)
+
+    # --- Sweep C: temperature amplitude ---
+    def make_temp(temp_amp, seed=11):
+        return make_data('piecewise', seed=seed,
+                         arw=0.03, bias_inst=0.003, bias_inst_tau=100.0,
+                         rrw=0.0003, sf_nonlin=0.02,
+                         temp_amp=temp_amp, temp_period=80.0,
+                         temp_oml_gain=0.1, temp_bias_gain=0.005)
+
+    temp_values = [0.0, 0.5, 1.0, 2.0, 5.0]
+    sweep_c = sweep_1d('Temperature sweep', make_temp, temp_values, tuned)
+
+    # Step 4: plots
+    if HAVE_MPL:
+        print(f"\n{'='*78}\nStep 4: Plotting 1D sweeps\n{'='*78}")
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+
+        sweep_specs = [
+            (axes[0], 'ARW sweep',       arw_values,    sweep_a,
+             'ARW level (rad/√s)', True),
+            (axes[1], 'Contamination sweep', contam_values, sweep_b,
+             'Contamination fraction', False),
+            (axes[2], 'Temperature sweep', temp_values,  sweep_c,
+             'Temperature amplitude (K)', False),
+        ]
+
+        for ax, title, xs, res, xlabel, logx in sweep_specs:
+            for est in ESTIMATORS:
+                color, marker = PALETTE[est]
+                ax.plot(xs, res[est], color=color, marker=marker,
+                        label=est, lw=1.8, markersize=7,
+                        markeredgecolor='black', markeredgewidth=0.5)
+            if logx:
+                ax.set_xscale('log')
+            ax.set_xlabel(xlabel, fontsize=10)
+            ax.set_ylabel('Mean |Ω̂ − Ω| (rad/s)', fontsize=10)
+            ax.set_title(title, fontsize=11, fontweight='bold')
+            ax.grid(True, alpha=0.3, which='both')
+
+        # legend on first panel only (frees space)
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc='lower center',
+                   ncol=5, fontsize=9, frameon=True,
+                   bbox_to_anchor=(0.5, -0.06))
+
+        fig.suptitle(
+            '1D sensitivity: how each error source changes estimator error '
+            f'({len(ESTIMATORS)} estimators)\n'
+            'Parameters tuned on realistic_full, held fixed across sweeps',
+            fontsize=12, y=1.02)
+        fig.tight_layout()
+        fig.savefig('sweep_1d.pdf', bbox_inches='tight')
+        fig.savefig('sweep_1d.png', dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print("  saved sweep_1d.pdf/.png")
+
+    # Summary
+    print(f"\n{'='*78}")
+    print(f"Total wall clock: {time.time()-t_start:.1f}s")
+    print("=" * 78)
+    print("\nNotes for the paper:")
+    print("  - 10 estimators spanning 4 families (Kalman, gradient, signal-proc, fixed-gain)")
+    print("  - Full RLG error budget: ARW + bias instability + RRW + SF nonlinearity + temperature")
+    print("  - 1D sweeps hold tuned params fixed (sensitivity, not best-case response)")
+    print("  - AR(2) and I/Q+OLS operate on different layers of the signal chain")
+    print("    (documented in the paper; not equivalent to recursive state estimators)")
