@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""
+Benchmark v7 — tune separately on dynamic Omega + harder maneuvers.
+
+Changes vs v6:
+  1. Two full tuning passes: one on static, one on dynamic Omega.
+     Each scenario uses its own tuned parameters.
+  2. Dynamic Omega made HARDER: 4 step changes at 80/100/120/140s,
+     multiple ramps, one "impulse" spike. Tests whether a DE estimator
+     can out-track the KF when dynamics outpace covariance adaptation.
+  3. Reports tuned parameters for BOTH regimes so we can see whether
+     SGD's chosen k_i shifts when the target is dynamic.
+
+Rest of the code identical to v6.
+"""
+import numpy as np
+import time
+from scipy.stats import t as student_t
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except ImportError:
+    HAVE_MPL = False
+
+TRAIN_SEEDS = [1, 2, 3]
+TEST_SEEDS  = [11, 12, 13, 21, 22, 23, 24]
+TE = np.arange(40.0, 200.0, 1.0)
+
+ESTIMATORS = ['KF', 'SGD', 'RLS', 'Huber KF', 'alpha-beta',
+              'Complementary', 'EKF', 'UKF']
+
+PALETTE = {
+    'KF':            ('black',       'o'),
+    'SGD':           ('red',         's'),
+    'RLS':           ('royalblue',   '^'),
+    'Huber KF':      ('green',       'D'),
+    'alpha-beta':    ('orange',      'v'),
+    'Complementary': ('purple',      'P'),
+    'EKF':           ('saddlebrown', 'X'),
+    'UKF':           ('darkviolet',  '*'),
+}
+
+
+# ============================================================
+# Data generation — with HARDER dynamic Omega
+# ============================================================
+def make_data(scenario, seed=11, T=200.0, R=16, DT=0.01,
+              arw=0.03, y_meas_std=None,
+              bias_inst=0.0, bias_inst_tau=100.0, rrw=0.0,
+              sf_nonlin=0.0,
+              temp_amp=0.0, temp_period=80.0, temp_phase_drift=0.0,
+              temp_oml_gain=0.1, temp_bias_gain=0.005,
+              backscatter_eps=0.0, omega_dynamic=False,
+              contam_pct=0.0, contam_sigma=5.0):
+    if y_meas_std is None:
+        y_meas_std = arw / np.sqrt(DT)
+
+    rng = np.random.default_rng(seed)
+    nt = int(T / DT)
+
+    def omega_fn(t):
+        base = 0.3 + 0.1 * np.sin(2 * np.pi * t / 100)
+        if omega_dynamic:
+            # HARDER: multiple steps + ramps + impulse
+            if 60 <= t < 70:   base += 0.15 * (t - 60) / 10     # fast ramp
+            elif 70 <= t < 80: base += 0.15
+            elif 80 <= t < 85: base -= 0.20                     # sharp step down
+            elif 85 <= t < 95: base += 0.10 * (t - 85) / 10     # moderate ramp
+            elif 95 <= t < 100: base -= 0.15                    # step down
+            elif 100 <= t < 102: base += 0.30                   # impulse spike
+            elif 102 <= t < 115: base -= 0.30 * (t - 102) / 13  # recover
+            elif 115 <= t < 130: base += 0.20                   # step up
+            elif 130 <= t < 140: base -= 0.10                   # step down
+            elif 140 <= t < 160: base += 0.08 * (t - 140) / 20  # slow ramp
+            elif t >= 160: base -= 0.10                         # final step
+        return base
+
+    psi = rng.uniform(-np.pi, np.pi, R)
+    S = np.zeros((nt, R)); Y = np.zeros((nt, R))
+
+    if scenario == 'diffusion':
+        oml_rw = np.clip(1.0 + np.cumsum(rng.standard_normal(nt) * 0.001), 0.5, 3.0)
+        def oml_of(k): return np.full(R, oml_rw[k])
+    else:
+        def oml_of(k): return np.full(R, 1.0 if k * DT < 60 else 2.0)
+
+    if contam_pct > 0:
+        cmask = rng.random((nt, R)) < contam_pct
+        cmag  = rng.choice([-1.0, 1.0], size=(nt, R)) * contam_sigma
+    else:
+        cmask = np.zeros((nt, R), dtype=bool)
+        cmag  = np.zeros((nt, R))
+
+    if bias_inst > 0:
+        rho = np.exp(-DT / bias_inst_tau)
+        sigma_ou = bias_inst * np.sqrt(1 - rho**2)
+    else:
+        rho = 1.0; sigma_ou = 0.0
+
+    bias_state = np.zeros((nt, R))
+    rrw_state  = np.zeros((nt, R))
+    T_state    = np.zeros((nt, R))
+    T_0 = 20.0
+
+    for k in range(nt):
+        t = k * DT
+        probe = np.sin(2 * np.pi * t / 5)
+        oml_base = oml_of(k)
+
+        if k > 0:
+            if bias_inst > 0:
+                bias_state[k] = rho*bias_state[k-1] + sigma_ou*rng.standard_normal(R)
+            if rrw > 0:
+                rrw_state[k] = rrw_state[k-1] + rrw*np.sqrt(DT)*rng.standard_normal(R)
+
+        T_state[k] = T_0 + temp_amp*np.sin(2*np.pi*t/temp_period + temp_phase_drift*t)
+        dT = T_state[k] - T_0
+        oml_eff  = oml_base * (1 + temp_oml_gain * dT)
+        bias_eff = bias_state[k] + temp_bias_gain * dT
+
+        s    = np.sin(psi)
+        s_bs = np.sin(psi + backscatter_eps)
+
+        true_rate = omega_fn(t) + bias_eff + rrw_state[k]
+        measured  = (1 + sf_nonlin) * true_rate
+        signal    = measured - oml_eff * s_bs
+        y_meas    = signal + y_meas_std * rng.standard_normal(R)
+        if cmask.any():
+            y_meas = y_meas + cmask[k] * cmag[k] * y_meas_std
+
+        raw_rate = omega_fn(t) + bias_eff + rrw_state[k] + probe - oml_eff * s_bs
+        noise_psi = arw * np.sqrt(DT) * rng.standard_normal(R)
+
+        S[k] = s; Y[k] = y_meas
+        psi  = psi + raw_rate*DT + noise_psi
+
+    return S, Y, omega_fn, oml_of, DT
+
+
+def make_static(seed=11):
+    return make_data('piecewise', seed=seed,
+                     arw=0.03, y_meas_std=0.3,
+                     bias_inst=0.003, bias_inst_tau=100.0,
+                     rrw=0.0003, sf_nonlin=0.02,
+                     temp_amp=1.0, temp_period=80.0, temp_phase_drift=0.01,
+                     temp_oml_gain=0.1, temp_bias_gain=0.005,
+                     backscatter_eps=0.05, omega_dynamic=False)
+
+
+def make_dynamic(seed=11):
+    return make_data('piecewise', seed=seed,
+                     arw=0.03, y_meas_std=0.3,
+                     bias_inst=0.003, bias_inst_tau=100.0,
+                     rrw=0.0003, sf_nonlin=0.02,
+                     temp_amp=1.0, temp_period=80.0, temp_phase_drift=0.01,
+                     temp_oml_gain=0.1, temp_bias_gain=0.005,
+                     backscatter_eps=0.05, omega_dynamic=True)
+
+
+# ============================================================
+# Estimators (identical to v6 — nothing changed here)
+# ============================================================
+def run_kf(S, Y, dt, q_o=1e-6, q_l=1e-6, r=0.09):
+    nt, R = Y.shape
+    th = np.tile([0.3, 1.0], (R, 1))
+    P  = np.tile(np.diag([0.01, 0.25]), (R, 1, 1))
+    est = np.zeros((nt, R))
+    for k in range(nt):
+        H  = np.stack([np.ones(R), -S[k]], axis=1)
+        P  = P + np.diag([q_o, q_l])
+        PH = P @ H[:, :, None]
+        Sv = (H[:, None, :] @ PH).squeeze(-1) + r
+        K  = PH / Sv[:, None, :]
+        innov = Y[k] - (H * th).sum(1)
+        th = th + (K @ innov[:, None, None]).squeeze(-1)
+        P  = P - K @ (H[:, None, :] @ P)
+        est[k] = th[:, 0]
+    return est
+
+
+def run_sgd(S, Y, dt, lr=0.3, k_i=0.01):
+    nt, R = Y.shape
+    E = Y[0].copy(); oml = np.full(R, 1.0); est = np.zeros((nt, R))
+    for k in range(nt):
+        P = (Y[k] + oml * S[k]) - E
+        E = E + k_i * P
+        oml = np.clip(oml - lr * P * S[k], 0.5, 3.0)
+        est[k] = E
+    return est
+
+
+def run_rls(S, Y, dt, lam=0.995):
+    nt, R = Y.shape
+    th = np.tile([0.3, 1.0], (R, 1))
+    P  = np.tile(np.eye(2) * 100.0, (R, 1, 1))
+    est = np.zeros((nt, R))
+    for k in range(nt):
+        H  = np.stack([np.ones(R), -S[k]], axis=1)
+        PH = (P @ H[:, :, None]).squeeze(-1)
+        denom = lam + (H * PH).sum(1)
+        K  = PH / denom[:, None]
+        innov = Y[k] - (H * th).sum(1)
+        th = th + K * innov[:, None]
+        P  = (P - K[:, :, None] * PH[:, None, :]) / lam
+        est[k] = th[:, 0]
+    return est
+
+
+def run_huber_kf(S, Y, dt, q_o=1e-6, q_l=1e-6, r=0.09, thr=1.345):
+    nt, R = Y.shape
+    th = np.tile([0.3, 1.0], (R, 1))
+    P  = np.tile(np.diag([0.01, 0.25]), (R, 1, 1))
+    est = np.zeros((nt, R))
+    for k in range(nt):
+        H  = np.stack([np.ones(R), -S[k]], axis=1)
+        P  = P + np.diag([q_o, q_l])
+        PH = (P @ H[:, :, None]).squeeze(-1)
+        Sv = (H * PH).sum(1) + r
+        sig = np.sqrt(Sv)
+        innov = Y[k] - (H * th).sum(1)
+        z = np.abs(innov) / sig
+        w = np.ones(R)
+        mask = z > thr
+        w[mask] = thr / z[mask]
+        r_eff = r / np.maximum(w, 1e-6)
+        Sv_eff = (H * PH).sum(1) + r_eff
+        K = PH / Sv_eff[:, None]
+        th = th + K * innov[:, None]
+        P  = P - K[:, :, None] * PH[:, None, :]
+        est[k] = th[:, 0]
+    return est
+
+
+def run_alpha_beta(S, Y, dt, alpha=0.1, beta=0.005, oml_nom=1.5):
+    nt, R = Y.shape
+    x = Y[0].copy(); v = np.zeros(R); est = np.zeros((nt, R))
+    for k in range(nt):
+        xp = x + v * dt
+        y_meas = Y[k] + oml_nom * S[k]
+        innov = y_meas - xp
+        x = xp + alpha * innov
+        v = v + (beta / dt) * innov
+        est[k] = x
+    return est
+
+
+def run_complementary(S, Y, dt, alpha=0.01, oml_nom=1.5):
+    nt, R = Y.shape
+    x = Y[0].copy(); est = np.zeros((nt, R))
+    for k in range(nt):
+        y_meas = Y[k] + oml_nom * S[k]
+        x = alpha * y_meas + (1 - alpha) * x
+        est[k] = x
+    return est
+
+
+def run_ekf(S, Y, dt, q_o=1e-6, q_l=1e-6, r_y=0.09, r_s=0.01):
+    nt, R = Y.shape
+    x = np.column_stack([np.full(R, 0.3), np.full(R, 1.0),
+                         np.arcsin(np.clip(S[0], -1, 1))])
+    P = np.tile(np.diag([0.01, 0.25, 1.0]), (R, 1, 1))
+    Q  = np.diag([q_o, q_l, 1e-3]); Rm = np.diag([r_y, r_s])
+    est = np.zeros((nt, R))
+    for k in range(nt):
+        s_p = np.sin(x[:, 2])
+        psi_p = x[:, 2] + dt * (x[:, 0] - x[:, 1] * s_p)
+        xp = np.column_stack([x[:, 0], x[:, 1], psi_p])
+        c_p = np.cos(x[:, 2])
+        F = np.zeros((R, 3, 3))
+        F[:, 0, 0] = 1.0; F[:, 1, 1] = 1.0
+        F[:, 2, 0] = dt;  F[:, 2, 1] = -dt * s_p
+        F[:, 2, 2] = 1.0 - dt * x[:, 1] * c_p
+        Pp = F @ P @ F.transpose(0, 2, 1) + Q
+        sp = np.sin(psi_p); cp = np.cos(psi_p)
+        h = np.column_stack([xp[:, 0] - xp[:, 1] * sp, sp])
+        H = np.zeros((R, 2, 3))
+        H[:, 0, 0] = 1.0; H[:, 0, 1] = -sp; H[:, 0, 2] = -xp[:, 1] * cp
+        H[:, 1, 2] = cp
+        z = np.column_stack([Y[k], S[k]]); nu = z - h
+        PH = Pp @ H.transpose(0, 2, 1)
+        Si = H @ PH + Rm + 1e-9 * np.eye(2)
+        K  = PH @ np.linalg.inv(Si)
+        x  = xp + (K @ nu[:, :, None]).squeeze(-1)
+        P  = (np.eye(3) - K @ H) @ Pp
+        est[k] = x[:, 0]
+    return est
+
+
+def run_ukf(S, Y, dt, q_o=1e-6, q_l=1e-6, r_y=0.09, r_s=0.01):
+    nt, R = Y.shape; n = 3
+    alpha, beta, kappa = 1e-3, 2.0, 0.0
+    lam = alpha**2 * (n + kappa) - n
+    Wm = np.full(2*n+1, 0.5/(n+lam)); Wc = Wm.copy()
+    Wm[0] = lam/(n+lam); Wc[0] = Wm[0] + (1 - alpha**2 + beta)
+    x = np.column_stack([np.full(R, 0.3), np.full(R, 1.0),
+                         np.arcsin(np.clip(S[0], -1, 1))])
+    P = np.tile(np.diag([0.01, 0.25, 1.0]), (R, 1, 1))
+    Q  = np.diag([q_o, q_l, 1e-3]); Rm = np.diag([r_y, r_s])
+    est = np.zeros((nt, R))
+
+    def f_batch(st):
+        s = np.sin(st[:, :, 2])
+        psi = st[:, :, 2] + dt * (st[:, :, 0] - st[:, :, 1] * s)
+        return np.stack([st[:, :, 0], st[:, :, 1], psi], axis=-1)
+    def h_batch(st):
+        s = np.sin(st[:, :, 2])
+        return np.stack([st[:, :, 0] - st[:, :, 1] * s, s], axis=-1)
+
+    for k in range(nt):
+        M = (n + lam) * P + 1e-9 * np.eye(3)
+        try: L = np.linalg.cholesky(M)
+        except np.linalg.LinAlgError: L = np.tile(np.eye(3) * 1e-3, (R, 1, 1))
+        sig = np.zeros((R, 2*n+1, n)); sig[:, 0] = x
+        for i in range(n):
+            sig[:, 1+i]   = x + L[:, :, i]
+            sig[:, 1+n+i] = x - L[:, :, i]
+        sig_f = f_batch(sig)
+        xp = (Wm[None, :, None] * sig_f).sum(1)
+        d = sig_f - xp[:, None, :]
+        Pp = np.einsum('i,nij,nik->njk', Wc, d, d) + Q
+        Z = h_batch(sig_f); zp = (Wm[None, :, None] * Z).sum(1)
+        dz = Z - zp[:, None, :]
+        Szz = np.einsum('i,nij,nik->njk', Wc, dz, dz) + Rm
+        Sxz = np.einsum('i,nij,nik->njk', Wc, d, dz)
+        K = Sxz @ np.linalg.inv(Szz + 1e-9 * np.eye(2))
+        z_obs = np.column_stack([Y[k], S[k]])
+        x = xp + (K @ (z_obs - zp)[:, :, None]).squeeze(-1)
+        P = Pp - K @ Szz @ K.transpose(0, 2, 1)
+        est[k] = x[:, 0]
+    return est
+
+
+def run_by_name(name, params, S, Y, dt):
+    return {
+        'KF':           lambda: run_kf(S, Y, dt, **params),
+        'SGD':          lambda: run_sgd(S, Y, dt, **params),
+        'RLS':          lambda: run_rls(S, Y, dt, **params),
+        'Huber KF':     lambda: run_huber_kf(S, Y, dt, **params),
+        'alpha-beta':   lambda: run_alpha_beta(S, Y, dt, **params),
+        'Complementary': lambda: run_complementary(S, Y, dt, **params),
+        'EKF':          lambda: run_ekf(S, Y, dt, **params),
+        'UKF':          lambda: run_ukf(S, Y, dt, **params),
+    }[name]()
+
+
+# ============================================================
+# Scoring + CI
+# ============================================================
+def score_and_bias(est, omega_fn, te, dt):
+    err = np.zeros(est.shape[1]); bias = np.zeros(est.shape[1]); n = 0
+    for t in te:
+        k = int(t/dt) - 1
+        diff = est[k] - omega_fn(t)
+        err += np.abs(diff); bias += diff; n += 1
+    return err / n, bias / n
+
+
+def per_seed_ci(errs_per_seed):
+    seed_means = np.array([e.mean() for e in errs_per_seed])
+    n = len(seed_means); m = seed_means.mean()
+    se = seed_means.std(ddof=1) / np.sqrt(n)
+    tc = student_t.ppf(0.975, n-1)
+    return m, m - tc*se, m + tc*se
+
+
+def paired_ci(a, b):
+    diffs = np.array([x.mean() - y.mean() for x, y in zip(a, b)])
+    n = len(diffs); m = diffs.mean()
+    se = diffs.std(ddof=1) / np.sqrt(n)
+    tc = student_t.ppf(0.975, n-1)
+    return m, m - tc*se, m + tc*se
+
+
+# ============================================================
+# Tuning — unchanged from v6, now used TWICE (once per regime)
+# ============================================================
+def tune_all(train_maker, label=""):
+    train_data = []
+    for ts in TRAIN_SEEDS:
+        S, Y, om, _, dt = train_maker(seed=ts)
+        train_data.append(dict(S=S, Y=Y, omega=om, dt=dt))
+
+    def avg_score(name, params):
+        scores = []
+        for td in train_data:
+            e = run_by_name(name, params, td['S'], td['Y'], td['dt'])
+            err, _ = score_and_bias(e, td['omega'], TE, td['dt'])
+            scores.append(err.mean())
+        return float(np.mean(scores))
+
+    tuned = {}
+
+    best = (np.inf, dict(q_o=1e-6, q_l=1e-6))
+    for q_o in (1e-9, 1e-8, 1e-7, 1e-6, 1e-5):
+        for q_l in (1e-8, 1e-7, 1e-6, 1e-5):
+            p = dict(q_o=q_o, q_l=q_l); m = avg_score('KF', p)
+            if m < best[0]: best = (m, p)
+    tuned['KF'] = best[1]; print(f"  [{label}] KF            {best[1]}  score={best[0]:.4f}")
+
+    best = (np.inf, dict(lr=0.3, k_i=0.01))
+    for k_i in (1e-3, 3e-3, 1e-2, 3e-2, 1e-1):
+        for lr in (0.01, 0.03, 0.1, 0.3):
+            p = dict(lr=lr, k_i=k_i); m = avg_score('SGD', p)
+            if m < best[0]: best = (m, p)
+    tuned['SGD'] = best[1]; print(f"  [{label}] SGD           {best[1]}  score={best[0]:.4f}")
+
+    best = (np.inf, dict(lam=0.999))
+    for lam in (0.99, 0.995, 0.999):
+        p = dict(lam=lam); m = avg_score('RLS', p)
+        if m < best[0]: best = (m, p)
+    tuned['RLS'] = best[1]; print(f"  [{label}] RLS           {best[1]}  score={best[0]:.4f}")
+
+    kf_p = tuned['KF']
+    best = (np.inf, dict(q_o=kf_p['q_o'], q_l=kf_p['q_l'], thr=2.0))
+    for thr in (1.0, 1.345, 2.0):
+        p = dict(q_o=kf_p['q_o'], q_l=kf_p['q_l'], thr=thr)
+        m = avg_score('Huber KF', p)
+        if m < best[0]: best = (m, p)
+    tuned['Huber KF'] = best[1]; print(f"  [{label}] Huber KF      {best[1]}  score={best[0]:.4f}")
+
+    best = (np.inf, dict(alpha=0.1, beta=0.005))
+    for alpha in (0.05, 0.1, 0.2):
+        for beta in (0.001, 0.005, 0.01):
+            p = dict(alpha=alpha, beta=beta); m = avg_score('alpha-beta', p)
+            if m < best[0]: best = (m, p)
+    tuned['alpha-beta'] = best[1]; print(f"  [{label}] alpha-beta    {best[1]}  score={best[0]:.4f}")
+
+    best = (np.inf, dict(alpha=0.01))
+    for alpha in (0.005, 0.01, 0.02, 0.05):
+        p = dict(alpha=alpha); m = avg_score('Complementary', p)
+        if m < best[0]: best = (m, p)
+    tuned['Complementary'] = best[1]; print(f"  [{label}] Complementary {best[1]}  score={best[0]:.4f}")
+
+    for name in ('EKF', 'UKF'):
+        best = (np.inf, dict(q_o=kf_p['q_o'], q_l=kf_p['q_l'], r_s=0.01))
+        for r_s in (0.01, 0.05, 0.1):
+            p = dict(q_o=kf_p['q_o'], q_l=kf_p['q_l'], r_s=r_s)
+            m = avg_score(name, p)
+            if m < best[0]: best = (m, p)
+        tuned[name] = best[1]; print(f"  [{label}] {name:<13} {best[1]}  score={best[0]:.4f}")
+
+    return tuned
+
+
+# ============================================================
+# Baseline table
+# ============================================================
+def run_baseline_table(tuned, train_maker, label):
+    print(f"\n{'='*78}\n{label}\n{'='*78}")
+    errs = {est: [] for est in ESTIMATORS}
+    for ts in TEST_SEEDS:
+        S, Y, om, _, dt = train_maker(seed=ts)
+        for est in ESTIMATORS:
+            e = run_by_name(est, tuned[est], S, Y, dt)
+            err, _ = score_and_bias(e, om, TE, dt)
+            errs[est].append(err)
+
+    print(f"  {'Estimator':<15}{'Mean (per-seed CI)':>32}{'KF diff':>28}")
+    print("  " + "-" * 78)
+    kf_errs = errs['KF']
+    for est in ESTIMATORS:
+        m, lo, hi = per_seed_ci(errs[est])
+        if est == 'KF':
+            diff_s = ""
+        else:
+            dm, dlo, dhi = paired_ci(errs[est], kf_errs)
+            v = "tie" if dlo < 0 < dhi else ("better" if dm < 0 else "worse")
+            diff_s = f"{dm:+.4f} [{dlo:+.4f},{dhi:+.4f}] {v}"
+        print(f"  {est:<15}{m:>7.4f} [{lo:+.4f},{hi:+.4f}]   {diff_s}")
+
+    return errs
+
+
+# ============================================================
+# Main — TWO full tuning + evaluation passes
+# ============================================================
+if __name__ == "__main__":
+    t0 = time.time()
+    print("=" * 78)
+    print("Benchmark v7 — separate tuning per regime + harder dynamic Omega")
+    print("=" * 78)
+
+    # ============ STATIC ============
+    print("\n" + "#" * 78)
+    print("# REGIME 1: STATIC Omega")
+    print("#" * 78)
+    tuned_static = tune_all(make_static, label="static")
+    errs_static = run_baseline_table(tuned_static, make_static, "Baseline: STATIC Ω (tuned on static)")
+
+    # ============ DYNAMIC ============
+    print("\n" + "#" * 78)
+    print("# REGIME 2: DYNAMIC Omega (harder maneuvers)")
+    print("#" * 78)
+    tuned_dynamic = tune_all(make_dynamic, label="dynamic")
+    errs_dynamic = run_baseline_table(tuned_dynamic, make_dynamic, "Baseline: DYNAMIC Ω (tuned on dynamic)")
+
+    # ============ CROSS-EVALUATION (the interesting part) ============
+    print("\n" + "#" * 78)
+    print("# CROSS-EVAL: does static-tuned SGD survive on dynamic Ω, and vice versa?")
+    print("#" * 78)
+
+    for tune_label, tuned_set in [("static-tuned", tuned_static),
+                                    ("dynamic-tuned", tuned_dynamic)]:
+        for eval_label, maker in [("static-eval", make_static),
+                                    ("dynamic-eval", make_dynamic)]:
+            errs = {}
+            for est in ESTIMATORS:
+                per_seed = []
+                for ts in TEST_SEEDS:
+                    S, Y, om, _, dt = maker(seed=ts)
+                    e = run_by_name(est, tuned_set[est], S, Y, dt)
+                    err, _ = score_and_bias(e, om, TE, dt)
+                    per_seed.append(err)
+                errs[est] = per_seed
+            kf_m = per_seed_ci(errs['KF'])[0]
+            sgd_m = per_seed_ci(errs['SGD'])[0]
+            gap = (sgd_m - kf_m) / kf_m * 100
+            print(f"  {tune_label:14s} → {eval_label:14s}  KF={kf_m:.4f}  SGD={sgd_m:.4f}  gap={gap:+.1f}%")
+
+    # ============ SUMMARY: SGD tuning shift ============
+    print("\n" + "#" * 78)
+    print("# SGD parameter shift between regimes")
+    print("#" * 78)
+    print(f"  {'Parameter':<10}{'Static-tuned':>18}{'Dynamic-tuned':>18}")
+    print("  " + "-" * 50)
+    for p in ['k_i', 'lr']:
+        print(f"  {p:<10}{tuned_static['SGD'][p]:>18.2e}{tuned_dynamic['SGD'][p]:>18.2e}")
+
+    print("\n" + "#" * 78)
+    print("# KF parameter shift between regimes")
+    print("#" * 78)
+    print(f"  {'Parameter':<10}{'Static-tuned':>18}{'Dynamic-tuned':>18}")
+    print("  " + "-" * 50)
+    for p in ['q_o', 'q_l']:
+        print(f"  {p:<10}{tuned_static['KF'][p]:>18.2e}{tuned_dynamic['KF'][p]:>18.2e}")
+
+    print(f"\nTotal wall clock: {time.time()-t0:.1f}s")
