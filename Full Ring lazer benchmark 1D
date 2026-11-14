@@ -1,739 +1,1146 @@
 #!/usr/bin/env python3
 """
-Extended benchmark with full RLG error budget + 1D sweeps + 10 estimators.
-
-Estimators (10, spanning 4 families):
-  Kalman     : KF, EKF, UKF, Huber KF
-  Gradient   : SGD (covariance-free observer), RLS
-  Signal-proc: AR(2) two-stage pipeline, I/Q+OLS fusion
-  Fixed-gain : alpha-beta, Complementary
-
-Simulation adds to baseline (ARW-only):
-  - Bias instability (OU process on rate)
-  - Rate random walk (drift on rate)
-  - Scale-factor nonlinearity (quadratic in rate)
-  - Temperature drift (affects OmegaL and bias continuously)
-
-Produces 1D sweeps:
-  - ARW sweep
-  - Contamination sweep
-  - Temperature sweep
-
-Hyperparameters tuned on 'realistic_full' across 3 train seeds, then
-held fixed across all 1D sweeps (sweeps measure sensitivity, not retuning).
-
-Runtime: ~20 min on Kaggle CPU.
+RLG estimator benchmark v16 -- SINGLE-FILE release (paper methodology).  Everything is in this file:
+simulator, 15 estimators, tuner with automatic grid expansion, evaluation, sweeps, cost/latency, tables, figures,
+Track B/C/D interface stubs.   Usage:
+    pip install numpy scipy matplotlib
+    python3 rlg_bench_v16_single.py describe          # table of what is used (setup, seeds, regimes, estimators, grids)
+    python3 rlg_bench_v16_single.py selftest          # correctness checks (~1 min)
+    python3 rlg_bench_v16_single.py all [--resume]    # tune -> eval -> sweeps -> costs -> report, mild then harsh (~1 h on 1 CPU core)
+    python3 rlg_bench_v16_single.py {tune|eval|sweeps|costs|report} [mild|harsh]
+Notebook (Kaggle/Colab/Jupyter): paste this file into one cell (or save it with the writefile cell magic), run it, then call  main(['selftest'])  and  main(['all', '--resume'])
+Env:  RLG_SMOKE=1 (tiny budget for testing the pipeline), RLG_OUT=<dir> (default ./results), RLG_MODEL=extended (optional extra realism)
+Outputs (./results): results_combined.md (all tables + generated findings), results_mild.md, results_harsh.md,
+pareto_frontier.png, sweeps_combined.png, tuned_*.json, eval_*.json, sweeps_mild.json, costs.json
 """
+import os, sys, json, time, itertools
 import numpy as np
-import time
-from scipy.stats import t as student_t
+from scipy.signal import lfilter
+from scipy.stats import t as student_t, ttest_rel
 
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
-    HAVE_MPL = True
-except ImportError:
-    HAVE_MPL = False
-    print("WARNING: matplotlib not installed. Sweep plots will be skipped.")
-
-# ============================================================
-# Configuration
-# ============================================================
-TRAIN_SEEDS = [1, 2, 3]
-TEST_SEEDS  = [11, 12, 13, 21, 22, 23, 24]
-TE = np.arange(40.0, 200.0, 1.0)
-SCENARIO_REALISTIC = 'realistic_full'
-
-ESTIMATORS = ['KF', 'SGD', 'RLS', 'Huber KF', 'alpha-beta',
-              'Complementary', 'EKF', 'UKF', 'AR(2)', 'I/Q+OLS']
-
-PALETTE = {
-    'KF':            ('black',       'o'),
-    'SGD':           ('red',         's'),
-    'RLS':           ('royalblue',   '^'),
-    'Huber KF':      ('green',       'D'),
-    'alpha-beta':    ('orange',      'v'),
-    'Complementary': ('purple',      'P'),
-    'EKF':           ('saddlebrown', 'X'),
-    'UKF':           ('darkviolet',  '*'),
-    'AR(2)':         ('teal',        'h'),
-    'I/Q+OLS':       ('darkorange',  '8'),
-}
-
-
-# ============================================================
-# Extended data generation
-# ============================================================
-def make_data(scenario, seed=11, T=200.0, R=16, DT=0.01,
-              arw=0.03,
-              bias_inst=0.0,
-              bias_inst_tau=100.0,
-              rrw=0.0,
-              sf_nonlin=0.0,
-              temp_amp=0.0,
-              temp_period=80.0,
-              temp_oml_gain=0.1,
-              temp_bias_gain=0.005):
-    """
-    Full RLG error-budget data generation.
-    dpsi/dt = Omega(t) + bias(t) + rrw(t) + probe - OmegaL_eff(t)*sin(psi)
-    y_meas  = signal_rate * (1 + sf_nonlin * signal_rate)
-    psi    += raw_rate*DT + arw*sqrt(DT)*N(0,1)
-    """
-    rng = np.random.default_rng(seed)
-    nt = int(T / DT)
-    omega_fn = lambda t: 0.3 + 0.1 * np.sin(2 * np.pi * t / 100)
-    psi = rng.uniform(-np.pi, np.pi, R)
-    S = np.zeros((nt, R)); Y = np.zeros((nt, R))
-
-    # OmegaL baseline dynamics
-    if scenario == 'diffusion':
-        oml_rw = np.clip(1.0 + np.cumsum(rng.standard_normal(nt) * 0.001), 0.5, 3.0)
-        def oml_of(k): return np.full(R, oml_rw[k])
-    else:
-        def oml_of(k): return np.full(R, 1.0 if k * DT < 60 else 2.0)
-
-    # Contamination
-    if scenario == 'extreme_outliers_2pct':
-        contam = rng.random((nt, R)) < 0.02
-        contam_mag = rng.choice([-5.0, 5.0], size=(nt, R))
-    elif scenario == 'extreme_outliers_5pct':
-        contam = rng.random((nt, R)) < 0.05
-        contam_mag = rng.choice([-10.0, 10.0], size=(nt, R))
-    else:
-        contam = np.zeros((nt, R), dtype=bool)
-        contam_mag = np.zeros((nt, R))
-
-    # OU bias instability
-    if bias_inst > 0:
-        rho = np.exp(-DT / bias_inst_tau)
-        sigma_ou = bias_inst * np.sqrt(1 - rho**2)
-    else:
-        rho = 1.0
-        sigma_ou = 0.0
-
-    bias = np.zeros((nt, R))
-    rrw_state = np.zeros((nt, R))
-    T_state = np.zeros((nt, R))
-    T_0 = 20.0
-
-    for k in range(nt):
-        t = k * DT
-        probe = np.sin(2 * np.pi * t / 5)
-        oml_base = oml_of(k)
-
-        if k > 0:
-            if bias_inst > 0:
-                bias[k] = rho * bias[k-1] + sigma_ou * rng.standard_normal(R)
-            if rrw > 0:
-                rrw_state[k] = rrw_state[k-1] + rrw * np.sqrt(DT) * rng.standard_normal(R)
-
-        T_state[k] = T_0 + temp_amp * np.sin(2 * np.pi * t / temp_period)
-        dT = T_state[k] - T_0
-
-        oml_eff = oml_base * (1 + temp_oml_gain * dT)
-        bias_eff = bias[k] + temp_bias_gain * dT
-
-        s = np.sin(psi)
-        raw_rate = omega_fn(t) + bias_eff + rrw_state[k] + probe - oml_eff * s
-        signal_rate = omega_fn(t) + bias_eff + rrw_state[k] - oml_eff * s
-        y_meas = signal_rate * (1 + sf_nonlin * signal_rate)
-
-        noise = arw * np.sqrt(DT) * rng.standard_normal(R)
-        if contam.any():
-            noise = noise + contam[k] * contam_mag[k] * arw * np.sqrt(DT)
-
-        dpsi = raw_rate * DT + noise
-        S[k] = s
-        Y[k] = y_meas
-        psi = psi + dpsi
-
-    return S, Y, omega_fn, oml_of, DT
+# ======================= CONFIG (paper methodology; identical to configs/*.yaml) =======================
+CFG = {'dt': 0.01,
+ 'T': 200.0,
+ 'units': 16,
+ 'lockin': {'mild': {'oml0': 0.2, 'label': 'mild, OmegaL/A=1/200'}, 'harsh': {'oml0': 1.0, 'label': 'harsh, OmegaL/A=1/40'}},
+ 'regimes': {'static': {'profile': 'static', 'oml_event': 'step2'},
+             'dynamic': {'profile': 'dynamic', 'oml_event': 'none'},
+             'thermal': {'profile': 'static', 'oml_event': 'thermal'}},
+ 'base': {'arw': 0.02,
+          'sig_q': 0.02,
+          'glitch': 0.0,
+          'dither_A': 40.0,
+          'dither_w': 3.141592653589793,
+          'dither_sig': 0.02,
+          'dither_sf_err': 0.0,
+          'oml_unit_std': 0.0,
+          'oml_ou_tau': 60.0,
+          'oml_ou_std': 0.0,
+          'eps_max': 0.3,
+          'bias_inst': 0.004,
+          'bias_tau': 100.0,
+          'rrw': 0.0003,
+          'sf_std': 0.0,
+          'sf_temp': 0.0,
+          'temp_amp': 0.0,
+          'temp_period': 80.0,
+          'temp_ramp': 0.0,
+          'temp_oml': 0.0,
+          'temp_bias': 0.0,
+          'iq_gain_err': 0.0,
+          'iq_offset': 0.0,
+          'iq_quad_err': 0.0},
+ 'extended': {'oml_unit_std': 0.1,
+              'oml_ou_std': 0.05,
+              'sf_std': 0.005,
+              'sf_temp': 0.001,
+              'temp_amp': 1.0,
+              'temp_oml': 0.1,
+              'temp_bias': 0.005,
+              'iq_gain_err': 0.02,
+              'iq_offset': 0.01,
+              'iq_quad_err': 0.02,
+              'dither_sf_err': 0.0005},
+ 'sweeps': {'glitch': [0.0, 0.001, 0.005, 0.01, 0.02], 'dither_ratio': [50, 100, 200, 500, 1000]}}
+SEEDS = {'train': [1, 2, 3], 'test': [11, 12, 13, 21, 22, 23, 24], 'sweep': [11, 12, 13]}
 
 
-def make_realistic(seed=11):
-    """Realistic scenario: all error sources active at typical ratios."""
-    return make_data('piecewise', seed=seed,
-                     arw=0.03,
-                     bias_inst=0.003, bias_inst_tau=100.0,
-                     rrw=0.0003, sf_nonlin=0.02,
-                     temp_amp=1.0, temp_period=80.0,
-                     temp_oml_gain=0.1, temp_bias_gain=0.005)
 
+# ======================= ESTIMATORS: _common =======================
+import numpy as np
 
-# ============================================================
-# Estimators
-# ============================================================
-def run_kf(S, Y, dt, q_o=1e-6, q_l=1e-6, r=0.09):
-    nt, R = Y.shape
-    th = np.tile([0.3, 1.0], (R, 1))
-    P  = np.tile(np.diag([0.01, 0.25]), (R, 1, 1))
-    est = np.zeros((nt, R))
-    for k in range(nt):
-        H  = np.stack([np.ones(R), -S[k]], axis=1)
-        P  = P + np.diag([q_o, q_l])
-        PH = P @ H[:, :, None]
-        Sv = (H[:, None, :] @ PH).squeeze(-1) + r
-        K  = PH / Sv[:, None, :]
-        innov = Y[k] - (H * th).sum(1)
-        th = th + (K @ innov[:, None, None]).squeeze(-1)
-        P  = P - K @ (H[:, None, :] @ P)
-        est[k] = th[:, 0]
+def wrap(x):
+    return (x + np.pi) % (2 * np.pi) - np.pi
+
+def frontend(I, Q, dm, dt):
+    """Differenced-phase front end.  Y_k = dphi_k/dt - d_{k-1} = Omega - OmegaL*sin(psi_{k-1}) + noise."""
+    A = np.hypot(I, Q) + 1e-9; c = I / A; s = Q / A
+    dphi = np.zeros_like(c)
+    dphi[1:] = np.arctan2(s[1:] * c[:-1] - c[1:] * s[:-1], c[1:] * c[:-1] + s[1:] * s[:-1])
+    Y = np.zeros_like(c); Y[1:] = dphi[1:] / dt - dm[:-1]
+    S = np.zeros_like(c); S[1:] = s[:-1]
+    return Y, S
+
+def phase_loop(I, Q, dm, dt, alpha, ratio, sine_detector):
+    """Second-order type-II tracking loop on phase. beta = ratio*alpha^2/(2-alpha)."""
+    nt, R = I.shape; beta = ratio * alpha ** 2 / (2 - alpha)
+    ph = np.arctan2(Q[0], I[0]); om = np.zeros(R); est = np.zeros((nt, R))
+    for k in range(1, nt):
+        pp = ph + dt * (om + dm[k - 1])
+        if sine_detector:
+            r = (Q[k] * np.cos(pp) - I[k] * np.sin(pp)) / (np.hypot(I[k], Q[k]) + 1e-9)
+        else:
+            r = wrap(np.arctan2(Q[k], I[k]) - pp)
+        ph = pp + alpha * r; om = om + (beta / dt) * r; est[k] = om
     return est
 
+# ======================= ESTIMATORS: phase_tracking =======================
+"""Phase-domain estimators: PLL (sin phase detector on I/Q) and LP readout (differenced phase, dither removed, low-passed)."""
+import numpy as np
+from scipy.signal import lfilter
 
-def run_sgd(S, Y, dt, lr=0.3, k_i=0.01):
-    nt, R = Y.shape
-    E = Y[0].copy(); oml = np.full(R, 1.0); est = np.zeros((nt, R))
-    for k in range(nt):
+def run_pll(I, Q, dm, dt, ctx, alpha=0.05, ratio=1.0):
+    return phase_loop(I, Q, dm, dt, alpha, ratio, True)
+
+def run_lp(I, Q, dm, dt, ctx, alpha=0.003):
+    Y, _ = frontend(I, Q, dm, dt); nt, R = Y.shape; x = np.zeros(R); est = np.zeros((nt, R))
+    for k in range(1, nt): x = x + alpha * (Y[k] - x); est[k] = x      # explicit per-step loop (comparable cost)
+    return est
+
+# ======================= ESTIMATORS: fixed_gain =======================
+"""Fixed-gain estimators: alpha-beta phase tracker (wrapped-phase detector) and complementary (lock-in-compensated readout)."""
+import numpy as np
+from scipy.signal import lfilter
+
+def run_ab(I, Q, dm, dt, ctx, alpha=0.05, ratio=1.0):
+    return phase_loop(I, Q, dm, dt, alpha, ratio, False)
+
+def run_complementary(I, Q, dm, dt, ctx, alpha=0.003):
+    """Omega_hat <- Omega_hat + alpha*(Y + OmegaL_nom*sin(psi) - Omega_hat), with the *nominal* lock-in rate (fixed, not adapted)."""
+    Y, S = frontend(I, Q, dm, dt); nt, R = Y.shape; x = np.zeros(R); est = np.zeros((nt, R))
+    for k in range(1, nt): x = x + alpha * (Y[k] + ctx['oml_nom'] * S[k] - x); est[k] = x
+    return est
+
+# ======================= ESTIMATORS: gradient_family =======================
+"""Gradient / recursive-regression estimators on the differenced observable Y = Omega - OmegaL*sin(psi)."""
+import numpy as np
+
+def run_sgd(I, Q, dm, dt, ctx, lr=1e-3, k_i=3e-3):
+    """Author's gradient observer."""
+    Y, S = frontend(I, Q, dm, dt); nt, R = Y.shape
+    E = np.zeros(R); oml = np.full(R, ctx['oml_nom']); est = np.zeros((nt, R))
+    for k in range(1, nt):
         P = (Y[k] + oml * S[k]) - E
-        E = E + k_i * P
-        oml = np.clip(oml - lr * P * S[k], 0.5, 3.0)
-        est[k] = E
+        E = E + k_i * P; oml = np.clip(oml - lr * P * S[k], 0.0, 5.0); est[k] = E
     return est
 
-
-def run_rls(S, Y, dt, lam=0.995):
-    nt, R = Y.shape
-    th = np.tile([0.3, 1.0], (R, 1))
-    P  = np.tile(np.eye(2) * 100.0, (R, 1, 1))
-    est = np.zeros((nt, R))
-    for k in range(nt):
-        H  = np.stack([np.ones(R), -S[k]], axis=1)
-        PH = (P @ H[:, :, None]).squeeze(-1)
-        denom = lam + (H * PH).sum(1)
-        K  = PH / denom[:, None]
-        innov = Y[k] - (H * th).sum(1)
-        th = th + K * innov[:, None]
-        P  = (P - K[:, :, None] * PH[:, None, :]) / lam
-        est[k] = th[:, 0]
-    return est
-
-
-def run_huber_kf(S, Y, dt, q_o=1e-6, q_l=1e-6, r=0.09, thr=1.345):
-    nt, R = Y.shape
-    th = np.tile([0.3, 1.0], (R, 1))
-    P  = np.tile(np.diag([0.01, 0.25]), (R, 1, 1))
-    est = np.zeros((nt, R))
-    for k in range(nt):
-        H  = np.stack([np.ones(R), -S[k]], axis=1)
-        P  = P + np.diag([q_o, q_l])
-        PH = (P @ H[:, :, None]).squeeze(-1)
-        Sv = (H * PH).sum(1) + r
-        sig = np.sqrt(Sv)
-        innov = Y[k] - (H * th).sum(1)
-        z = np.abs(innov) / sig
-        w = np.ones(R)
-        mask = z > thr
-        w[mask] = thr / z[mask]
-        r_eff  = r / np.maximum(w, 1e-6)
-        Sv_eff = (H * PH).sum(1) + r_eff
-        K = PH / Sv_eff[:, None]
-        th = th + K * innov[:, None]
-        P  = P - K[:, :, None] * PH[:, None, :]
-        est[k] = th[:, 0]
-    return est
-
-
-def run_alpha_beta(S, Y, dt, alpha=0.1, beta=0.005, oml_nom=1.5):
-    nt, R = Y.shape
-    x = Y[0].copy(); v = np.zeros(R); est = np.zeros((nt, R))
-    for k in range(nt):
-        xp = x + v * dt
-        y_meas = Y[k] + oml_nom * S[k]
-        innov = y_meas - xp
-        x = xp + alpha * innov
-        v = v + (beta / dt) * innov
-        est[k] = x
-    return est
-
-
-def run_complementary(S, Y, dt, alpha=0.01, oml_nom=1.5):
-    nt, R = Y.shape
-    x = Y[0].copy(); est = np.zeros((nt, R))
-    for k in range(nt):
-        y_meas = Y[k] + oml_nom * S[k]
-        x = alpha * y_meas + (1 - alpha) * x
-        est[k] = x
-    return est
-
-
-def run_ekf(S, Y, dt, q_o=1e-6, q_l=1e-6, r_y=0.09, r_s=0.01):
-    nt, R = Y.shape
-    x = np.column_stack([np.full(R, 0.3), np.full(R, 1.0),
-                         np.arcsin(np.clip(S[0], -1, 1))])
-    P = np.tile(np.diag([0.01, 0.25, 1.0]), (R, 1, 1))
-    Q  = np.diag([q_o, q_l, 1e-3])
-    Rm = np.diag([r_y, r_s])
-    est = np.zeros((nt, R))
-    for k in range(nt):
-        s_p = np.sin(x[:, 2])
-        psi_p = x[:, 2] + dt * (x[:, 0] - x[:, 1] * s_p)
-        xp = np.column_stack([x[:, 0], x[:, 1], psi_p])
-        c_p = np.cos(x[:, 2])
-        F = np.zeros((R, 3, 3))
-        F[:, 0, 0] = 1.0; F[:, 1, 1] = 1.0
-        F[:, 2, 0] = dt;  F[:, 2, 1] = -dt * s_p
-        F[:, 2, 2] = 1.0 - dt * x[:, 1] * c_p
-        Pp = F @ P @ F.transpose(0, 2, 1) + Q
-        sp = np.sin(psi_p); cp = np.cos(psi_p)
-        h = np.column_stack([xp[:, 0] - xp[:, 1] * sp, sp])
-        H = np.zeros((R, 2, 3))
-        H[:, 0, 0] = 1.0; H[:, 0, 1] = -sp; H[:, 0, 2] = -xp[:, 1] * cp
-        H[:, 1, 2] = cp
-        z  = np.column_stack([Y[k], S[k]])
-        nu = z - h
-        PH = Pp @ H.transpose(0, 2, 1)
-        Si = H @ PH + Rm + 1e-9 * np.eye(2)
-        K  = PH @ np.linalg.inv(Si)
-        x  = xp + (K @ nu[:, :, None]).squeeze(-1)
-        P  = (np.eye(3) - K @ H) @ Pp
-        est[k] = x[:, 0]
-    return est
-
-
-def run_ukf(S, Y, dt, q_o=1e-6, q_l=1e-6, r_y=0.09, r_s=0.01):
-    nt, R = Y.shape
-    n = 3
-    alpha, beta, kappa = 1e-3, 2.0, 0.0
-    lam = alpha**2 * (n + kappa) - n
-    Wm = np.full(2*n+1, 0.5/(n+lam))
-    Wc = Wm.copy()
-    Wm[0] = lam/(n+lam); Wc[0] = Wm[0] + (1 - alpha**2 + beta)
-
-    x = np.column_stack([np.full(R, 0.3), np.full(R, 1.0),
-                         np.arcsin(np.clip(S[0], -1, 1))])
-    P = np.tile(np.diag([0.01, 0.25, 1.0]), (R, 1, 1))
-    Q  = np.diag([q_o, q_l, 1e-3])
-    Rm = np.diag([r_y, r_s])
-    est = np.zeros((nt, R))
-
-    def f_batch(st):
-        s = np.sin(st[:, :, 2])
-        psi = st[:, :, 2] + dt * (st[:, :, 0] - st[:, :, 1] * s)
-        return np.stack([st[:, :, 0], st[:, :, 1], psi], axis=-1)
-
-    def h_batch(st):
-        s = np.sin(st[:, :, 2])
-        return np.stack([st[:, :, 0] - st[:, :, 1] * s, s], axis=-1)
-
-    for k in range(nt):
-        M = (n + lam) * P + 1e-9 * np.eye(3)
-        try:
-            L = np.linalg.cholesky(M)
-        except np.linalg.LinAlgError:
-            L = np.tile(np.eye(3) * 1e-3, (R, 1, 1))
-        sig = np.zeros((R, 2*n+1, n))
-        sig[:, 0] = x
-        for i in range(n):
-            sig[:, 1+i]   = x + L[:, :, i]
-            sig[:, 1+n+i] = x - L[:, :, i]
-        sig_f = f_batch(sig)
-        xp = (Wm[None, :, None] * sig_f).sum(1)
-        d  = sig_f - xp[:, None, :]
-        Pp = np.einsum('i,nij,nik->njk', Wc, d, d) + Q
-        Z  = h_batch(sig_f)
-        zp = (Wm[None, :, None] * Z).sum(1)
-        dz = Z - zp[:, None, :]
-        Szz = np.einsum('i,nij,nik->njk', Wc, dz, dz) + Rm
-        Sxz = np.einsum('i,nij,nik->njk', Wc, d, dz)
-        K = Sxz @ np.linalg.inv(Szz + 1e-9 * np.eye(2))
-        z_obs = np.column_stack([Y[k], S[k]])
-        x = xp + (K @ (z_obs - zp)[:, :, None]).squeeze(-1)
-        P = Pp - K @ Szz @ K.transpose(0, 2, 1)
-        est[k] = x[:, 0]
-    return est
-
-
-def run_ar2(S, Y, dt, lam=0.99, lp=0.02):
-    """
-    AR(2) frequency tracker + low-pass state smoother.
-
-    Stage 1: AR(2) on S = sin(psi). Fits a1, a2 via exponentially-weighted
-             RLS. Recovers w = dpsi/dt from the complex pole angle.
-    Stage 2: Omega_hat ~ low-pass(w - probe).
-    """
-    nt, R = Y.shape
-    a1 = np.zeros(R); a2 = np.zeros(R)
-    P_ar = np.tile(np.eye(2) * 100.0, (R, 1, 1))
-    S_p1 = S[0].copy(); S_p2 = S[0].copy()
-    w_psi = np.zeros((nt, R))
+def run_sgd_biexp(I, Q, dm, dt, ctx, lr=1e-3, k_i=3e-3, tau_f=5.0, tau_s=50.0):
+    """Leaky-integrator variant (v13).  NOTE: all three components receive the same gradient, so this is a
+    leaky integrator with ~3x effective gain, not an identifiable bi-exponential model; tau values are the
+    simulator's true thermal time constants (oracle)."""
+    Y, S = frontend(I, Q, dm, dt); nt, R = Y.shape
+    a_f = np.exp(-dt / tau_f); a_s = np.exp(-dt / tau_s)
+    E = np.zeros(R); Lb = np.full(R, ctx['oml_nom']); Lf = np.zeros(R); Ls = np.zeros(R); est = np.zeros((nt, R))
     for k in range(1, nt):
-        s = S[k]
-        x = np.stack([S_p1, S_p2], axis=1)
-        Px = (P_ar @ x[:, :, None]).squeeze(-1)
-        denom = lam + (x * Px).sum(1)
-        K = Px / denom[:, None]
-        pred = (x * np.stack([a1, a2], axis=1)).sum(1)
-        innov = s - pred
-        a1 = a1 + K[:, 0] * innov
-        a2 = a2 + K[:, 1] * innov
-        P_ar = (P_ar - K[:, :, None] * Px[:, None, :]) / lam
-        r = np.sqrt(np.maximum(-a2, 1e-12))
-        theta = np.arccos(np.clip(a1 / (2 * r + 1e-12), -1, 1))
-        w_psi[k] = theta / dt
-        S_p2 = S_p1; S_p1 = s
-
-    est = np.zeros((nt, R))
-    omega_hat = w_psi[1] - np.sin(2 * np.pi * dt / 5)
-    for k in range(1, nt):
-        probe = np.sin(2 * np.pi * (k * dt) / 5)
-        omega_meas = w_psi[k] - probe
-        omega_hat = omega_hat + lp * (omega_meas - omega_hat)
-        est[k] = omega_hat
+        oml = Lb + Lf + Ls
+        P = (Y[k] + oml * S[k]) - E; E = E + k_i * P; g = lr * P * S[k]
+        Lb = np.clip(Lb - g, -1.0, 5.0); Lf = a_f * Lf - g; Ls = a_s * Ls - g; est[k] = E
     return est
 
-
-def run_iq_ols(S, Y, dt, lam=0.99, tau_q=0.1):
-    """
-    I/Q + OLS fusion: fuse Y (in-phase) and a delayed-Q proxy.
-    Q is constructed via a first-order all-pass filter (tau_q).
-    Running-variance OLS weights then gradient tracking of the fused signal.
-    """
-    nt, R = Y.shape
-    alpha_q = (dt - tau_q) / (dt + tau_q)
-    q = np.zeros((nt, R))
-    q[0] = Y[0]
+def run_rls(I, Q, dm, dt, ctx, lam=0.9999, p0=10.0):
+    """Exponentially-weighted RLS on y = Omega - OmegaL*sin(psi)."""
+    Y, S = frontend(I, Q, dm, dt); nt, R = Y.shape
+    th0 = np.zeros(R); th1 = np.full(R, ctx['oml_nom'])
+    p11 = np.full(R, p0); p12 = np.zeros(R); p22 = np.full(R, p0); est = np.zeros((nt, R))
     for k in range(1, nt):
-        q[k] = alpha_q * (q[k-1] + Y[k] - Y[k-1])
-
-    var_i = np.var(Y[:50], axis=0) + 1e-12
-    var_q = np.var(q[:50], axis=0) + 1e-12
-    freq = Y[0].copy()
-    est = np.zeros((nt, R))
-    est[0] = freq
-    for k in range(1, nt):
-        var_i = lam * var_i + (1 - lam) * Y[k]**2
-        var_q = lam * var_q + (1 - lam) * q[k]**2
-        w = var_q / (var_i + var_q + 1e-12)
-        fused = w * Y[k] + (1 - w) * q[k]
-        freq = freq + 0.05 * (fused - freq)
-        est[k] = freq
+        h2 = -S[k]; ph1 = p11 + p12 * h2; ph2 = p12 + p22 * h2
+        den = lam + ph1 + h2 * ph2; K1 = ph1 / den; K2 = ph2 / den
+        e = Y[k] - (th0 + h2 * th1); th0 = th0 + K1 * e; th1 = th1 + K2 * e
+        p11 = np.minimum((p11 - K1 * ph1) / lam, 1e4); p12 = (p12 - K1 * ph2) / lam
+        p22 = np.minimum((p22 - K2 * ph2) / lam, 1e4); est[k] = th0
     return est
 
+# ======================= ESTIMATORS: kalman_family =======================
+"""Kalman-family estimators.  All take (I, Q, dm, dt, ctx, **params); ctx = dict(sig, oml_nom, f_band)."""
+import numpy as np
 
-def run_by_name(name, params, S, Y, dt):
-    return {
-        'KF':           lambda: run_kf(S, Y, dt, **params),
-        'SGD':          lambda: run_sgd(S, Y, dt, **params),
-        'RLS':          lambda: run_rls(S, Y, dt, **params),
-        'Huber KF':     lambda: run_huber_kf(S, Y, dt, **params),
-        'alpha-beta':   lambda: run_alpha_beta(S, Y, dt, **params),
-        'Complementary': lambda: run_complementary(S, Y, dt, **params),
-        'EKF':          lambda: run_ekf(S, Y, dt, **params),
-        'UKF':          lambda: run_ukf(S, Y, dt, **params),
-        'AR(2)':        lambda: run_ar2(S, Y, dt, **params),
-        'I/Q+OLS':      lambda: run_iq_ols(S, Y, dt, **params),
-    }[name]()
+def run_kfp(I, Q, dm, dt, ctx, q_psi=1e-3, q_om=1e-6, huber=None, return_extras=False):
+    """Linear KF on [psi, Omega]; dither is a known input; lock-in term unmodelled.  huber=thr -> one-step
+    Huber reweighting of R (r_eff = r / min(1, thr/|z|)).  extras: NIS series and fraction of updates with w<1."""
+    nt, R = I.shape; r = ctx['sig'] ** 2
+    p = np.arctan2(Q[0], I[0]); v = np.zeros(R)
+    p11 = np.full(R, 0.05 ** 2); p12 = np.zeros(R); p22 = np.full(R, 0.5 ** 2)
+    est = np.zeros((nt, R)); nis = []; eng = 0; cnt = 0
+    for k in range(1, nt):
+        pp = p + dt * (v + dm[k - 1])
+        a11 = p11 + 2 * dt * p12 + dt * dt * p22 + q_psi * dt; a12 = p12 + dt * p22; a22 = p22 + q_om * dt
+        y = wrap(np.arctan2(Q[k], I[k]) - pp); S = a11 + r
+        if return_extras: nis.append(y * y / S)
+        if huber is not None:
+            z = np.abs(y) / np.sqrt(S); w = np.minimum(1.0, huber / np.maximum(z, 1e-12))
+            eng += int((w < 1).sum()); cnt += R; S = a11 + r / w
+        K1 = a11 / S; K2 = a12 / S; p = pp + K1 * y; v = v + K2 * y
+        p11 = (1 - K1) * a11; p12 = (1 - K1) * a12; p22 = a22 - K2 * a12; est[k] = v
+    if return_extras:
+        return est, dict(nis=np.array(nis), w_frac=(eng / cnt if cnt else 0.0))
+    return est
+
+def run_kfr(I, Q, dm, dt, ctx, q=1e-8, r_mult=1.0):
+    """Random-walk Kalman filter on regression parameters [Omega, OmegaL]; r = r_mult * 2*sigma^2/dt^2 (differenced-phase noise)."""
+    Y, S = frontend(I, Q, dm, dt); nt, R = Y.shape; r = r_mult * 2 * ctx['sig'] ** 2 / dt ** 2
+    th0 = np.zeros(R); th1 = np.full(R, ctx['oml_nom'])
+    p11 = np.full(R, 0.25); p12 = np.zeros(R); p22 = np.full(R, (0.3 * ctx['oml_nom']) ** 2); est = np.zeros((nt, R))
+    for k in range(1, nt):
+        p11 = p11 + q * dt; p22 = p22 + q * dt
+        h2 = -S[k]; ph1 = p11 + p12 * h2; ph2 = p12 + p22 * h2
+        Sv = ph1 + h2 * ph2 + r; K1 = ph1 / Sv; K2 = ph2 / Sv
+        e = Y[k] - (th0 + h2 * th1); th0 = th0 + K1 * e; th1 = th1 + K2 * e
+        p11 = p11 - K1 * ph1; p12 = p12 - K1 * ph2; p22 = p22 - K2 * ph2; est[k] = th0
+    return est
+
+def run_kf_biexp(I, Q, dm, dt, ctx, q=1e-7, r_mult=1.0, tau_f=5.0, tau_s=50.0):
+    """4-state regression KF [Omega, L_base, mode_fast, mode_slow] (v13).  NOTE: tau_f/tau_s equal the simulator's
+    thermal time constants (oracle); the three lock-in components are individually unidentifiable (only their sum is observed)."""
+    Y, S = frontend(I, Q, dm, dt); nt, R = Y.shape; r = r_mult * 2 * ctx['sig'] ** 2 / dt ** 2
+    a_f = np.exp(-dt / tau_f); a_s = np.exp(-dt / tau_s); F = np.diag([1.0, 1.0, a_f, a_s]); Qm = np.eye(4) * q * dt
+    L0 = ctx['oml_nom']; th = np.zeros((R, 4)); th[:, 1] = L0
+    P = np.tile(np.diag([0.25] + [(0.3 * L0) ** 2] * 3), (R, 1, 1)); est = np.zeros((nt, R))
+    for k in range(1, nt):
+        th = th @ F.T; P = F @ P @ F.T + Qm
+        H = np.stack([np.ones(R), -S[k], -S[k], -S[k]], 1)
+        PH = (P @ H[:, :, None])[:, :, 0]; Sv = (H * PH).sum(1) + r; K = PH / Sv[:, None]
+        th = th + K * (Y[k] - (H * th).sum(1))[:, None]; P = P - K[:, :, None] * PH[:, None, :]; est[k] = th[:, 0]
+    return est
+
+def _init(I, Q, R, ctx):
+    L0 = ctx['oml_nom']
+    x = np.stack([np.arctan2(Q[0], I[0]), np.zeros(R), np.full(R, L0)], 1)
+    P = np.tile(np.diag([0.05 ** 2, 0.5 ** 2, (0.3 * L0) ** 2]), (R, 1, 1))
+    return x, P
+
+def run_ekf(I, Q, dm, dt, ctx, q_psi=1e-4, q_om=1e-6, q_L=1e-6):
+    """EKF on [psi, Omega, OmegaL]; dpsi = dt*(Omega + d - OmegaL sin psi); measurement [cos psi, sin psi]; Joseph-form update."""
+    nt, R = I.shape; I3 = np.eye(3); x, P = _init(I, Q, R, ctx)
+    Qm = np.diag([q_psi * dt, q_om * dt, q_L * dt]); Rm = np.eye(2) * ctx['sig'] ** 2; est = np.zeros((nt, R))
+    for k in range(1, nt):
+        s = np.sin(x[:, 0]); c = np.cos(x[:, 0]); d = dm[k - 1]
+        xp = np.stack([x[:, 0] + dt * (x[:, 1] + d - x[:, 2] * s), x[:, 1], x[:, 2]], 1)
+        F = np.tile(I3, (R, 1, 1)); F[:, 0, 0] = 1 - dt * x[:, 2] * c; F[:, 0, 1] = dt; F[:, 0, 2] = -dt * s
+        Pp = F @ P @ F.transpose(0, 2, 1) + Qm
+        sp = np.sin(xp[:, 0]); cp = np.cos(xp[:, 0]); H = np.zeros((R, 2, 3)); H[:, 0, 0] = -sp; H[:, 1, 0] = cp
+        nu = np.stack([I[k] - cp, Q[k] - sp], 1); PHt = Pp @ H.transpose(0, 2, 1)
+        K = PHt @ np.linalg.inv(H @ PHt + Rm); x = xp + (K @ nu[:, :, None])[:, :, 0]
+        IKH = I3 - K @ H; P = IKH @ Pp @ IKH.transpose(0, 2, 1) + K @ Rm @ K.transpose(0, 2, 1); est[k] = x[:, 1]
+    return est
+
+def run_ukf(I, Q, dm, dt, ctx, q_psi=1e-4, q_om=1e-6, q_L=1e-6):
+    """UKF, same model as EKF; scaled UT with alpha=1, beta=2, kappa=0."""
+    nt, R = I.shape; n = 3; I3 = np.eye(3)
+    Wm = np.full(7, 1 / 6); Wm[0] = 0.0; Wc = Wm.copy(); Wc[0] = 2.0
+    x, P = _init(I, Q, R, ctx); Qm = np.diag([q_psi * dt, q_om * dt, q_L * dt]); Rm = np.eye(2) * ctx['sig'] ** 2
+    est = np.zeros((nt, R))
+    for k in range(1, nt):
+        P = 0.5 * (P + P.transpose(0, 2, 1))
+        try: L = np.linalg.cholesky(n * P + 1e-12 * I3)
+        except np.linalg.LinAlgError: L = np.tile(np.eye(3) * 1e-3, (R, 1, 1))
+        sg = np.empty((R, 7, 3)); sg[:, 0] = x
+        for i in range(n): sg[:, 1 + i] = x + L[:, :, i]; sg[:, 1 + n + i] = x - L[:, :, i]
+        sf = sg.copy(); sf[:, :, 0] = sg[:, :, 0] + dt * (sg[:, :, 1] + dm[k - 1][:, None] - sg[:, :, 2] * np.sin(sg[:, :, 0]))
+        xp = (Wm[None, :, None] * sf).sum(1); dx = sf - xp[:, None, :]
+        Pp = np.einsum('i,nij,nik->njk', Wc, dx, dx) + Qm
+        Z = np.stack([np.cos(sf[:, :, 0]), np.sin(sf[:, :, 0])], -1)
+        zp = (Wm[None, :, None] * Z).sum(1); dz = Z - zp[:, None, :]
+        Szz = np.einsum('i,nij,nik->njk', Wc, dz, dz) + Rm; Sxz = np.einsum('i,nij,nik->njk', Wc, dx, dz)
+        K = Sxz @ np.linalg.inv(Szz)
+        x = xp + (K @ (np.stack([I[k], Q[k]], 1) - zp)[:, :, None])[:, :, 0]
+        P = Pp - K @ Szz @ K.transpose(0, 2, 1); est[k] = x[:, 1]
+    return est
+
+# ======================= ESTIMATORS: frequency_domain =======================
+"""Frequency-domain estimators from the RLG literature (zero-crossing: 2021 automated quality assessment;
+windowed-FFT peak with parabolic interpolation: Shi 2026).
+
+IMPORTANT (read before interpreting results): from S = sin(psi) alone these estimators recover the fringe-frequency
+MAGNITUDE |psi_dot|/(2*pi).  psi_dot = Omega + d(t) - OmegaL sin(psi); with a dither that reverses psi_dot the sign of
+Omega is not observable from |psi_dot|.  The only physically defined conversion is  Omega_hat = 2*pi*f_hat - mean_window|d_meas|,
+which is exact only when psi_dot never reverses.  Whatever these estimators do under strong dither is therefore a
+property of that definition, and is reported as such.  Search band for FFT peak: Shi's 15-25 Hz band is hardware-specific;
+here it is derived from the dither spec (0 .. 1.2*(A+OmegaL)/(2*pi) Hz).
+Latency of both = window/2 samples."""
+import numpy as np
+from scipy.signal import lfilter
+
+def _mov_mean(x, window):
+    cs = np.cumsum(x, 0); out = cs.copy(); out[window:] = cs[window:] - cs[:-window]
+    n = np.minimum(np.arange(1, len(x) + 1), window)[:, None]
+    return out / n
+
+def _finish(w_hat, dm, window, dt):
+    om = w_hat - _mov_mean(np.abs(dm), window)
+    om[:window] = 0.0
+    a = 1.0 / window
+    return lfilter([a], [1, -(1 - a)], om, axis=0)
+
+def run_zero_cross(I, Q, dm, dt, ctx, window=200):
+    s = Q / (np.hypot(I, Q) + 1e-9); sg = np.where(s >= 0, 1.0, -1.0)
+    cross = np.zeros_like(s); cross[1:] = (sg[1:] != sg[:-1])
+    cs = np.cumsum(cross, 0); cnt = cs.copy(); cnt[window:] = cs[window:] - cs[:-window]
+    n = np.minimum(np.arange(1, len(s) + 1), window)[:, None]
+    f = (cnt / 2.0) / (n * dt)
+    return _finish(2 * np.pi * f, dm, window, dt)
+
+def run_fft_peak(I, Q, dm, dt, ctx, window=300, hop=10):
+    s = Q / (np.hypot(I, Q) + 1e-9); nt, R = s.shape; fs = 1.0 / dt
+    win = np.hanning(window)[:, None]; freqs = np.fft.rfftfreq(window, dt)
+    lo, hi = ctx['f_band']; idx = np.where((freqs >= max(lo, freqs[1])) & (freqs <= hi))[0]
+    if len(idx) < 3: idx = np.arange(1, len(freqs) - 1)
+    f_hat = np.zeros((nt, R)); ar = np.arange(R)
+    for k in range(window - 1, nt, hop):
+        seg = s[k - window + 1:k + 1]; seg = (seg - seg.mean(0)) * win
+        sub = np.abs(np.fft.rfft(seg, axis=0))[idx]; m = sub.argmax(0)
+        mi = np.clip(m, 1, len(idx) - 2)
+        a, b, c = sub[mi - 1, ar], sub[mi, ar], sub[mi + 1, ar]
+        delta = np.where((m > 0) & (m < len(idx) - 1), 0.5 * (a - c) / (a - 2 * b + c + 1e-12), 0.0)
+        f_hat[k:min(k + hop, nt)] = ((idx[m] + delta) * fs / window)[None, :]
+    return _finish(2 * np.pi * f_hat, dm, window, dt)
+
+# ======================= ESTIMATOR REGISTRY =======================
+# name -> (callable, family)
+REGISTRY = {
+    'KF': (run_kfp, 'Kalman'), 'Huber KF': (run_kfp, 'Kalman'), 'EKF': (run_ekf, 'Kalman'), 'UKF': (run_ukf, 'Kalman'),
+    'KF-biexp': (run_kf_biexp, 'Kalman'), 'KF-reg': (run_kfr, 'Kalman'),
+    'SGD (author)': (run_sgd, 'Gradient'), 'SGD-biexp': (run_sgd_biexp, 'Gradient'), 'RLS': (run_rls, 'Gradient'),
+    'alpha-beta': (run_ab, 'Fixed-gain'), 'Complementary': (run_complementary, 'Fixed-gain'),
+    'PLL': (run_pll, 'Phase'), 'LP readout': (run_lp, 'Phase'),
+    'Zero-crossing': (run_zero_cross, 'Frequency'), 'FFT-peak': (run_fft_peak, 'Frequency'),
+}
+ORDER = list(REGISTRY)
 
 
-# ============================================================
-# Utilities
-# ============================================================
-def score(est, omega_fn, te, dt):
-    return np.array([np.abs(est[int(t/dt)-1] - omega_fn(t)) for t in te]).mean(0)
+# ======================= TRACK A: lock-in rate estimation (implemented) =======================
+"""Track A: estimation of the input rate Omega from quadrature fringe readout in the presence of lock-in.
+FULLY IMPLEMENTED.  Simulator, scoring, tuning (with automatic grid expansion), evaluation, sweeps, cost/latency."""
+import os, json, time, itertools
+import numpy as np
+from scipy.signal import lfilter
 
+try: ROOT = os.path.dirname(os.path.abspath(__file__))
+except NameError: ROOT = os.getcwd()          # notebooks (Kaggle/Colab/Jupyter) have no __file__
+SMOKE = bool(os.environ.get('RLG_SMOKE'))
+OUT = os.environ.get('RLG_OUT', f"{ROOT}/results"); os.makedirs(OUT, exist_ok=True)
+DT = CFG['dt']; T = 100.0 if SMOKE else CFG['T']; R_UNITS = CFG['units']
+TRAIN = SEEDS['train'][:1] if SMOKE else SEEDS['train']
+TEST = SEEDS['test'][:2] if SMOKE else SEEDS['test']
+SWEEP = SEEDS['sweep'][:1] if SMOKE else SEEDS['sweep']
+REGS = list(CFG['regimes']); LOCKIN = list(CFG['lockin'])
 
-def ci_95(d):
-    n = len(d)
-    if n < 2: return f"{d.mean():+.4f} [n/a]"
-    se = d.std(ddof=1) / np.sqrt(n)
-    tc = student_t.ppf(0.975, n - 1)
-    return f"{d.mean():+.4f} [{d.mean()-tc*se:+.4f},{d.mean()+tc*se:+.4f}]"
+def cfg_for(lockin, regime, **over):
+    c = dict(CFG['base'])
+    if os.environ.get('RLG_MODEL') == 'extended': c.update(CFG['extended'])
+    c.update(CFG['regimes'][regime]); c['oml0'] = CFG['lockin'][lockin]['oml0']; c.update(over); return c
 
+# ------------------------------------------------------------------ simulator
+def omega_profile(t, kind):
+    if kind == 'const': return np.full_like(t, 0.3)
+    base = 0.3 + 0.1 * np.sin(2 * np.pi * t / 100)
+    if kind == 'dynamic':
+        a = np.zeros_like(t)
+        def seg(lo, hi, f):
+            m = (t >= lo) & (t < hi); a[m] += f(t[m])
+        seg(60, 70, lambda x: 0.15 * (x - 60) / 10); seg(70, 80, lambda x: 0.15 + 0 * x)
+        seg(80, 85, lambda x: -0.20 + 0 * x);        seg(85, 95, lambda x: 0.10 * (x - 85) / 10)
+        seg(95, 100, lambda x: -0.15 + 0 * x);       seg(100, 102, lambda x: 0.30 + 0 * x)
+        seg(102, 115, lambda x: -0.30 * (x - 102) / 13); seg(115, 130, lambda x: 0.20 + 0 * x)
+        seg(130, 140, lambda x: -0.10 + 0 * x);      seg(140, 160, lambda x: 0.08 * (x - 140) / 20)
+        seg(160, 1e9, lambda x: -0.10 + 0 * x)
+        base = base + a
+    return base
 
-def fmt(v):
-    if isinstance(v, float):
-        if 1e-3 <= abs(v) < 1e3: return f"{v:.3g}"
-        return f"{v:.1e}"
-    return str(v)
+def ou(rng, tau, std, shape):
+    rho = np.exp(-DT / tau); s = std * np.sqrt(1 - rho ** 2)
+    return lfilter([1.0], [1.0, -rho], rng.standard_normal(shape) * s, axis=0)
 
+def simulate(cfg, seed, T_=None, R=R_UNITS):
+    T_ = T if T_ is None else T_
+    rng = np.random.default_rng(seed); nt = int(round(T_ / DT)); t = np.arange(nt) * DT
+    Om = omega_profile(t, cfg['profile'])
+    dT = cfg['temp_amp'] * np.sin(2 * np.pi * t / cfg['temp_period'] + 0.3) + cfg['temp_ramp'] * t / T_
+    eps = rng.uniform(-cfg['eps_max'], cfg['eps_max'], R)
+    oml_u = cfg['oml0'] * (1 + cfg['oml_unit_std'] * rng.standard_normal(R))
+    sf0 = cfg['sf_std'] * rng.standard_normal(R); dsf = cfg['dither_sf_err'] * rng.standard_normal(R)
+    bias = ou(rng, cfg['bias_tau'], cfg['bias_inst'], (nt, R))
+    rrw = np.cumsum(rng.standard_normal((nt, R)), 0) * cfg['rrw'] * np.sqrt(DT)
+    ev = np.ones(nt)
+    if cfg['oml_event'] == 'step2': ev = np.where(t >= 60, 2.0, 1.0)
+    elif cfg['oml_event'] == 'thermal':
+        tp = np.clip(t - 30, 0, None); ev = 1 + np.where(t >= 30, 0.4 * np.exp(-tp / 5) + 0.1 * np.exp(-tp / 50), 0)
+    oml = oml_u[None, :] * ev[:, None] * (1 + ou(rng, cfg['oml_ou_tau'], cfg['oml_ou_std'], (nt, R))) * (1 + cfg['temp_oml'] * dT[:, None])
+    oml = np.maximum(oml, 0.0)
+    sf = 1 + sf0[None, :] + cfg['sf_temp'] * dT[:, None]
+    drate = Om[:, None] + bias + rrw + cfg['temp_bias'] * dT[:, None]
+    d_true = cfg['dither_A'] * np.sin(cfg['dither_w'] * t)
+    n_psi = rng.standard_normal((nt, R)) * cfg['arw'] * np.sqrt(DT)
+    psi = np.empty((nt, R)); psi[0] = rng.uniform(-np.pi, np.pi, R)
+    for k in range(nt - 1):
+        psi[k + 1] = psi[k] + DT * (sf[k] * (drate[k] + d_true[k]) - oml[k] * np.sin(psi[k] + eps)) + n_psi[k]
+    g2 = 1 + cfg['iq_gain_err'] * rng.standard_normal(R)
+    o1 = cfg['iq_offset'] * rng.standard_normal(R); o2 = cfg['iq_offset'] * rng.standard_normal(R)
+    phq = cfg['iq_quad_err'] * rng.standard_normal(R)
+    I = np.cos(psi) + o1 + cfg['sig_q'] * rng.standard_normal((nt, R))
+    Q = g2 * np.sin(psi + phq) + o2 + cfg['sig_q'] * rng.standard_normal((nt, R))
+    if cfg['glitch'] > 0:
+        m = rng.random((nt, R)) < cfg['glitch']
+        I = np.where(m, rng.uniform(-1.5, 1.5, (nt, R)), I); Q = np.where(m, rng.uniform(-1.5, 1.5, (nt, R)), Q)
+    dm = d_true[:, None] * sf * (1 + dsf[None, :]) + cfg['dither_sig'] * rng.standard_normal((nt, R))  # pickoff calibrated in gyro units
+    ctx = dict(sig=cfg['sig_q'], oml_nom=cfg['oml0'], f_band=(0.0, 1.2 * (cfg['dither_A'] + cfg['oml0']) / (2 * np.pi)))
+    return dict(I=I, Q=Q, dm=dm, Om=Om, t=t, ctx=ctx)
 
-# ============================================================
-# Tuning (all 10 estimators)
-# ============================================================
-def tune_all(train_maker):
-    train_data = []
-    for ts in TRAIN_SEEDS:
-        S, Y, om, _, dt = train_maker(seed=ts)
-        train_data.append(dict(S=S, Y=Y, omega=om, dt=dt))
+# -------------------------------------------------------------------- scoring
+def run_est(name, params, sim, extras=False):
+    fn = REGISTRY[name][0]; kw = dict(params)
+    if extras: kw['return_extras'] = True
+    return fn(sim['I'], sim['Q'], sim['dm'], DT, sim['ctx'], **kw)
 
-    def avg_score(name, params):
-        scores = []
-        for td in train_data:
-            e = run_by_name(name, params, td['S'], td['Y'], td['dt'])
-            scores.append(score(e, td['omega'], TE, td['dt']))
-        return float(np.mean(scores))
+def metrics(est, sim):
+    """norm = MAE / MAE of the no-skill mean predictor (1.0 = no skill).  unit_norm: same, per unit (for 7x16 paired tests)."""
+    nt = len(sim['Om']); b = int(0.2 * nt); om = sim['Om'][b:]
+    e = np.nan_to_num(est[b:], nan=50., posinf=50., neginf=-50.)
+    err = np.minimum(np.abs(e - om[:, None]), 50.)
+    mae = float(err.mean()); ns_mae = float(np.abs(om - om.mean()).mean()); mo = float(np.abs(om).mean())
+    rmse = float(np.sqrt(np.mean(np.minimum((e - om[:, None]) ** 2, 2500.))))
+    m = e.mean(1); sd = float(m.std()); so = float(om.std())
+    corr = float(np.corrcoef(m, om)[0, 1]) if sd > 1e-12 and so > 1e-12 else 0.0
+    if not np.isfinite(corr): corr = 0.0
+    return dict(mae=mae, norm=mae / ns_mae, norm_abs=mae / mo, rmse=rmse, corr=corr, std_ratio=sd / so, ns_mae=ns_mae,
+                unit_norm=(err.mean(0) / ns_mae).tolist())
 
+# --------------------------------------------------------------------- tuning
+def grid(**kw):
+    ks = list(kw); return [dict(zip(ks, v)) for v in itertools.product(*kw.values())]
+
+EXPAND = dict(huber=4.0, window=2.0); CAPS = dict(alpha=0.5, ratio=10.0, window=4000); NOEXPAND = {'hop'}
+
+def refine(name, gd, obj, fixed=None, expansions=3):
+    """Grid search with automatic expansion: if the best value of a parameter is at a grid edge, extend that
+    edge by one decade (x4 for huber thr, x2 for windows, one decade in 1-lambda for lam) and retune, up to
+    `expansions` times.  Reports parameters still at an edge as grid-limited."""
+    gd = {k: sorted(v) for k, v in gd.items()}; fixed = fixed or {}; cache = {}
+    if SMOKE: gd = {k: v[:2] for k, v in gd.items()}
+    for rnd in range(expansions + 1):
+        for p in grid(**gd):
+            key = tuple(sorted(p.items()))
+            if key not in cache: cache[key] = obj(name, dict(p, **fixed))
+        key, m = min(cache.items(), key=lambda kv: kv[1]); p = dict(key); grew = False
+        if SMOKE or rnd == expansions: break
+        for k, v in gd.items():
+            if k in NOEXPAND or len(v) < 2: continue
+            if k == 'lam':
+                if p[k] == v[0] and v[0] > 0.5: v.insert(0, 1 - (1 - v[0]) * 10); grew = True
+                continue
+            f = EXPAND.get(k, 10.0)
+            if p[k] == v[0]:
+                if k == 'huber': new = v[0] / 2; ok = new >= 0.25
+                else:
+                    new = v[0] / f
+                    if k == 'window': new = int(new)
+                    ok = new >= (10 if k == 'window' else 0)
+                if ok and new not in v: v.insert(0, new); grew = True
+            elif p[k] == v[-1]:
+                new = v[-1] * f
+                if k == 'window': new = int(new)
+                if new <= CAPS.get(k, np.inf): v.append(new); grew = True
+        if not grew: break
+    edge = [k for k, v in gd.items() if len(v) > 1 and k not in NOEXPAND and p[k] in (v[0], v[-1])]
+    return dict(params=dict(p, **fixed), edge=edge, evals=len(cache), obj=float(m), rounds=rnd + 1)
+
+def tune_config(lockin, log=print):
+    t0 = time.time(); sims = []
+    for reg in REGS:
+        for sd in TRAIN: sims.append(simulate(cfg_for(lockin, reg), sd))
+    log(f"[{lockin}] tuning sims ready: {len(sims)} ({time.time()-t0:.0f}s)")
+    def obj(name, p):
+        try: return float(np.mean([metrics(run_est(name, p, s), s)['norm'] for s in sims]))
+        except Exception: return np.inf
     tuned = {}
-
-    # KF: 12 combos
-    best = (np.inf, dict(q_o=1e-6, q_l=1e-6))
-    for q_o in (1e-7, 1e-6, 1e-5):
-        for q_l in (1e-8, 1e-7, 1e-6, 1e-5):
-            p = dict(q_o=q_o, q_l=q_l)
-            m = avg_score('KF', p)
-            if m < best[0]: best = (m, p)
-    tuned['KF'] = best[1]
-    print(f"  KF            {best[1]}  (score={best[0]:.4f})")
-
-    # SGD: 12 combos
-    best = (np.inf, dict(lr=0.3, k_i=0.01))
-    for k_i in (0.001, 0.003, 0.01, 0.03):
-        for lr in (5e-2, 1e-1, 3e-1):
-            p = dict(lr=lr, k_i=k_i)
-            m = avg_score('SGD', p)
-            if m < best[0]: best = (m, p)
-    tuned['SGD'] = best[1]
-    print(f"  SGD           {best[1]}  (score={best[0]:.4f})")
-
-    # RLS: 3 combos
-    best = (np.inf, dict(lam=0.999))
-    for lam in (0.99, 0.995, 0.999):
-        p = dict(lam=lam)
-        m = avg_score('RLS', p)
-        if m < best[0]: best = (m, p)
-    tuned['RLS'] = best[1]
-    print(f"  RLS           {best[1]}  (score={best[0]:.4f})")
-
-    # Huber: 3 combos (reuse KF q)
-    kf_p = tuned['KF']
-    best = (np.inf, dict(q_o=kf_p['q_o'], q_l=kf_p['q_l'], thr=2.0))
-    for thr in (1.0, 1.345, 2.0):
-        p = dict(q_o=kf_p['q_o'], q_l=kf_p['q_l'], thr=thr)
-        m = avg_score('Huber KF', p)
-        if m < best[0]: best = (m, p)
-    tuned['Huber KF'] = best[1]
-    print(f"  Huber KF      {best[1]}  (score={best[0]:.4f})")
-
-    # alpha-beta: 9 combos
-    best = (np.inf, dict(alpha=0.1, beta=0.005))
-    for alpha in (0.05, 0.1, 0.2):
-        for beta in (0.001, 0.005, 0.01):
-            p = dict(alpha=alpha, beta=beta)
-            m = avg_score('alpha-beta', p)
-            if m < best[0]: best = (m, p)
-    tuned['alpha-beta'] = best[1]
-    print(f"  alpha-beta    {best[1]}  (score={best[0]:.4f})")
-
-    # Complementary: 4 combos
-    best = (np.inf, dict(alpha=0.01))
-    for alpha in (0.005, 0.01, 0.02, 0.05):
-        p = dict(alpha=alpha)
-        m = avg_score('Complementary', p)
-        if m < best[0]: best = (m, p)
-    tuned['Complementary'] = best[1]
-    print(f"  Complementary {best[1]}  (score={best[0]:.4f})")
-
-    # EKF, UKF: 3 combos each (reuse KF q)
-    for name in ('EKF', 'UKF'):
-        best = (np.inf, dict(q_o=kf_p['q_o'], q_l=kf_p['q_l'], r_s=0.01))
-        for r_s in (0.01, 0.05, 0.1):
-            p = dict(q_o=kf_p['q_o'], q_l=kf_p['q_l'], r_s=r_s)
-            m = avg_score(name, p)
-            if m < best[0]: best = (m, p)
-        tuned[name] = best[1]
-        print(f"  {name:<13} {best[1]}  (score={best[0]:.4f})")
-
-    # AR(2): 1 param x 4 = 4 combos
-    best = (np.inf, dict(lam=0.99, lp=0.02))
-    for lam in (0.95, 0.98, 0.99, 0.995):
-        p = dict(lam=lam, lp=0.02)
-        m = avg_score('AR(2)', p)
-        if m < best[0]: best = (m, p)
-    tuned['AR(2)'] = best[1]
-    print(f"  AR(2)         {best[1]}  (score={best[0]:.4f})")
-
-    # I/Q+OLS: 2 params x 12 combos
-    best = (np.inf, dict(lam=0.99, tau_q=0.1))
-    for lam in (0.95, 0.98, 0.99, 0.995):
-        for tau_q in (0.05, 0.1, 0.5):
-            p = dict(lam=lam, tau_q=tau_q)
-            m = avg_score('I/Q+OLS', p)
-            if m < best[0]: best = (m, p)
-    tuned['I/Q+OLS'] = best[1]
-    print(f"  I/Q+OLS       {best[1]}  (score={best[0]:.4f})")
-
+    def go(name, gd, fixed=None, key=None, exp=3):
+        r = refine(name, gd, obj, fixed, exp); tuned[key or name] = r
+        log(f"  [{lockin}] {key or name:<13} {r['params']}  obj={r['obj']:.3f} evals={r['evals']} rounds={r['rounds']} [{time.time()-t0:.0f}s]"
+            + (f"  GRID-LIMITED:{r['edge']}" if r['edge'] else ""))
+    go('KF', dict(q_psi=[1e-4, 1e-3, 1e-2, 1e-1, 1.0], q_om=[1e-9, 1e-8, 1e-7, 1e-6]))
+    kfq = {k: tuned['KF']['params'][k] for k in ('q_psi', 'q_om')}
+    go('Huber KF', dict(huber=[1.0, 1.345, 2.0, 3.0, 5.0, 8.0, 15.0, 25.0, 50.0, 100.0]), fixed=kfq)
+    go('EKF', dict(q_psi=[1e-5, 1e-4, 1e-3, 1e-2, 1e-1], q_om=[1e-6, 1e-5, 1e-4, 1e-3]), fixed=dict(q_L=1e-4), key='_ekf1')
+    e1 = {k: tuned['_ekf1']['params'][k] for k in ('q_psi', 'q_om')}
+    go('EKF', dict(q_L=[1e-6, 1e-5, 1e-4, 1e-3]), fixed=e1)
+    tuned['UKF'] = dict(tuned['EKF'], note='reuses EKF noise settings (same model)')
+    go('KF-reg', dict(q=[1e-8, 1e-7, 1e-6, 1e-5, 1e-4], r_mult=[.01, .1, 1, 10]))
+    go('KF-biexp', dict(q=[1e-9, 1e-8, 1e-7, 1e-6, 1e-5], r_mult=[.1, .3, 1, 3]))
+    go('SGD (author)', dict(k_i=[3e-4, 1e-3, 3e-3, 1e-2, 3e-2], lr=[3e-4, 1e-3, 3e-3, 1e-2]))
+    go('SGD-biexp', dict(k_i=[3e-4, 1e-3, 3e-3, 1e-2, 3e-2], lr=[3e-4, 1e-3, 3e-3, 1e-2]))
+    go('RLS', dict(lam=[.99, .995, .999, .9999]))
+    go('alpha-beta', dict(alpha=[.005, .01, .02, .05, .1], ratio=[.03, .1, .3, 1]))
+    go('Complementary', dict(alpha=[3e-4, 1e-3, 3e-3, 1e-2]))
+    go('PLL', dict(alpha=[.005, .01, .02, .05, .1], ratio=[.03, .1, .3, 1]))
+    go('LP readout', dict(alpha=[1e-4, 3e-4, 1e-3, 3e-3]))
+    go('Zero-crossing', dict(window=[50, 100, 200, 400]))
+    go('FFT-peak', dict(window=[100, 200, 300, 500, 1000], hop=[5, 10, 20]))
+    tuned.pop('_ekf1', None)
+    json.dump(tuned, open(f"{OUT}/tuned_{lockin}.json", 'w'), indent=1)
     return tuned
 
+# ----------------------------------------------------------------- evaluation
+def _tuned(lockin): return json.load(open(f"{OUT}/tuned_{lockin}.json"))
 
-# ============================================================
-# 1D sweep helper
-# ============================================================
-def sweep_1d(sweep_name, make_at_x, x_values, tuned):
-    print(f"\n{'='*78}\nSweep: {sweep_name}\n{'='*78}")
-    results = {est: [] for est in ESTIMATORS}
+def eval_config(lockin, log=print):
+    tuned = _tuned(lockin); out = {}
+    for reg in REGS:
+        t0 = time.time(); res = {e: dict(norm=[], mae=[], rmse=[], corr=[], std_ratio=[], w_frac=[], unit_norm=[]) for e in ORDER}; ns = []
+        for sd in TEST:
+            s = simulate(cfg_for(lockin, reg), sd)
+            for e in ORDER:
+                if e == 'Huber KF':
+                    est, ex = run_est(e, tuned[e]['params'], s, extras=True); wf = ex['w_frac']
+                else: est = run_est(e, tuned[e]['params'], s); wf = None
+                m = metrics(est, s)
+                for k in ('norm', 'mae', 'rmse', 'corr', 'std_ratio'): res[e][k].append(m[k])
+                res[e]['unit_norm'].append(m['unit_norm'])
+                if wf is not None: res[e]['w_frac'].append(wf)
+            ns.append(m['ns_mae'])
+        res['_ns'] = ns; out[reg] = res; log(f"  eval [{lockin}] {reg} done ({time.time()-t0:.0f}s)")
+        json.dump(out, open(f"{OUT}/eval_{lockin}.json", 'w'))
 
-    for x in x_values:
-        errs = {est: [] for est in ESTIMATORS}
-        for ts in TEST_SEEDS:
-            S, Y, om, _, dt = make_at_x(x, seed=ts)
-            for est in ESTIMATORS:
-                e = run_by_name(est, tuned[est], S, Y, dt)
-                errs[est].append(score(e, om, TE, dt))
-        for est in ESTIMATORS:
-            results[est].append(np.concatenate(errs[est]).mean())
+def eval_sweeps(lockin='mild', log=print):
+    tuned = _tuned(lockin); sw = CFG['sweeps']; out = {}
+    specs = dict(glitch=[('glitch', g, dict(glitch=g)) for g in sw['glitch']],
+                 dither=[('ratio', r, dict(oml0=CFG['base']['dither_A'] / r)) for r in sw['dither_ratio']])
+    for key, levels in specs.items():
+        out[key] = dict(levels=[l[1] for l in levels], res={e: [] for e in ORDER}, corr={e: [] for e in ORDER},
+                        huber_wfrac=[], ns=[])
+        for _, lv, over in levels:
+            per = {e: [] for e in ORDER}; pc = {e: [] for e in ORDER}; wf = []; nsl = []
+            for sd in SWEEP:
+                s = simulate(cfg_for(lockin, 'static', **over), sd)
+                for e in ORDER:
+                    if e == 'Huber KF':
+                        est, ex = run_est(e, tuned[e]['params'], s, extras=True); wf.append(ex['w_frac'])
+                    else: est = run_est(e, tuned[e]['params'], s)
+                    m = metrics(est, s); per[e].append(m['norm']); pc[e].append(m['corr'])
+                nsl.append(m['ns_mae'])
+            for e in ORDER: out[key]['res'][e].append(float(np.mean(per[e]))); out[key]['corr'][e].append(float(np.mean(pc[e])))
+            out[key]['huber_wfrac'].append(float(np.mean(wf))); out[key]['ns'].append(float(np.mean(nsl)))
+            log(f"  sweep {key}={lv} done")
+        json.dump(out, open(f"{OUT}/sweeps_{lockin}.json", 'w'))
 
-        line = f"  x={x:8.3g}  "
-        line += "  ".join(f"{e}={results[e][-1]:.4f}"
-                          for e in ['KF','SGD','Huber KF','AR(2)','I/Q+OLS'])
-        print(line)
+def lag_of(m, om, L=1500, step=10):
+    a = m - m.mean(); b = om - om.mean(); n = len(a); lags = np.arange(-L, L + 1, step)
+    c = [np.dot(a[l:], b[:n - l]) if l >= 0 else np.dot(a[:n + l], b[-l:]) for l in lags]
+    return int(lags[int(np.argmax(c))])
 
-    return results
+def measure_costs(lockin='mild', log=print):
+    tuned = _tuned(lockin); s = simulate(cfg_for(lockin, 'dynamic'), 99); nt = len(s['Om']); b = int(0.2 * nt); out = {}
+    for e in ORDER:
+        best = np.inf
+        for _ in range(2):
+            t0 = time.perf_counter(); est = run_est(e, tuned[e]['params'], s); best = min(best, time.perf_counter() - t0)
+        m = metrics(est, s); lag = lag_of(est[b:].mean(1), s['Om'][b:]) if m['corr'] > 0.3 else None
+        p = tuned[e]['params']; nominal = p['window'] // 2 if 'window' in p else None
+        out[e] = dict(us_per_step=best / nt * 1e6, lag_samples=lag, nominal_latency=nominal, corr=m['corr'])
+    kf = out['KF']['us_per_step']
+    for e in ORDER: out[e]['ratio'] = out[e]['us_per_step'] / kf
+    json.dump(out, open(f"{OUT}/costs.json", 'w'), indent=1); log("  costs done")
+
+# ======================= TRACKS B / C / D: interface contracts only (NOT implemented) =======================
+# ---- Track B (stub) ----
+"""
+Track B: Calibration parameter estimation.
+
+Estimates bias, scale-factor error, misalignment from a reference rotation sequence.
+NOT IMPLEMENTED in this paper. Interface contract below.
+
+Representative implementations in literature:
+  - Allan variance (IEEE Std 952, 2001/2004 revisions): noise-parameter extraction (ARW, bias instability, RRW)
+  - RLS calibration (2019): "A Calibration Method for the Errors of Ring Laser Gyro"
+  - Wavelet-domain estimation (2004)
+
+Interface contract (fill in to add this track):
+    def estimate_calibration(
+        reference_rates: np.ndarray,   # (T,) known rotation rates
+        measured_rates: np.ndarray,    # (T,) measured by the RLG
+    ) -> dict:
+        '''
+        Returns:
+          {
+            'bias': float,                      # rad/s
+            'scale_factor': float,              # dimensionless
+            'misalignment': np.ndarray,         # (3,) radians
+            'residual_std': float,              # rad/s
+          }
+        '''
+        raise NotImplementedError("Track B not implemented in this paper")
+"""
+def estimate_calibration(reference_rates, measured_rates):
+    raise NotImplementedError("Track B not implemented in this paper")
+# ---- Track C (stub) ----
+"""
+Track C: Temperature-drift compensation.
+
+Learns a mapping from temperature (and its history) to gyro bias / scale-factor drift and removes it.
+NOT IMPLEMENTED in this paper. Interface contract below.
+
+Representative implementations in literature (verify exact citations before use in the paper):
+  - Support-vector-machine (SVM) temperature compensation, 2014
+  - Gaussian-process regression (GPR) drift modelling, 2024
+  - Gradient-boosted trees (XGBoost) drift compensation, 2026
+
+Interface contract:
+    def fit_temperature_model(
+        temperature: np.ndarray,       # (T, n_sensors) temperature channels
+        rate_error: np.ndarray,        # (T,) measured minus reference rate (training segment)
+    ) -> object:                       # fitted model exposing .predict(temperature) -> (T,) drift estimate
+
+    def compensate(model, temperature: np.ndarray, measured_rates: np.ndarray) -> np.ndarray:
+        '''Returns drift-compensated rates, shape (T,).'''
+"""
+def fit_temperature_model(temperature, rate_error):
+    raise NotImplementedError("Track C not implemented in this paper")
+
+def compensate(model, temperature, measured_rates):
+    raise NotImplementedError("Track C not implemented in this paper")
+# ---- Track D (stub) ----
+"""
+Track D: Multi-sensor fusion.
+
+Fuses the RLG output with other rotation sensors (e.g. a second ring laser, fibre-optic gyro, MEMS) to improve
+long-term stability.  NOT IMPLEMENTED in this paper. Interface contract below.
+
+Representative implementations in literature:
+  - ROMY (2021): ring-laser array fusion for rotational seismology
+
+Interface contract:
+    def fuse(
+        rate_streams: dict,            # name -> (T,) rate estimates, each with its own sample clock resampled to a common grid
+        noise_models: dict,            # name -> dict(arw=..., bias_instability=..., rrw=...)
+    ) -> dict:
+        '''
+        Returns {'rate': (T,) fused rate, 'covariance': (T,) fused variance, 'weights': dict name -> float}
+        '''
+"""
+def fuse(rate_streams, noise_models):
+    raise NotImplementedError("Track D not implemented in this paper")
+
+# ======================= EMBEDDED DATA: earlier runs + reference v16 run =======================
+# AUTO-GENERATED by build_archive.py -- embedded data for cross-run comparison and the reference results
+import json
+ARCHIVE = json.loads(r'''{"v12": {"legacy": {"realistic_full": {"KF": [0.2304, null], "SGD (author)": [0.1382, null], "RLS": [0.5427, null], "alpha-beta": [2.7304, null], "Complementary": [1.4676, null], "AR(2)": [610.9215, null], "I/Q+OLS": [4.7782, null]}}}, "v13": {"legacy": {"static": {"KF": [1.1092, null], "Huber KF": [1.0495, null], "EKF": [1.0085, null], "UKF": [1.6365, null], "SGD (author)": [1.3498, null], "SGD-biexp": [1.3413, null]}, "dynamic": {"KF": [0.88, null], "Huber KF": [0.8747, null], "EKF": [0.8587, null], "UKF": [0.9564, null], "SGD (author)": [0.8702, null], "SGD-biexp": [0.8604, null]}, "thermal": {"KF": [0.5922, null], "Huber KF": [0.587, null], "EKF": [0.57, null], "UKF": [0.9266, null], "SGD (author)": [0.6621, null], "SGD-biexp": [0.6758, null]}}}, "v14": {"harsh": {"static": {"LP readout": [1.31983, null], "alpha-beta": [1.32035, null], "PLL": [1.32035, null], "KF": [1.08518, null], "Huber KF": [1.08518, null], "EKF": [0.32642, null], "UKF": [0.3265, null], "RLS": [0.40264, null], "KF-reg": [0.37836, null], "SGD (author)": [0.36687, null]}, "dynamic": {"LP readout": [1.1194, null], "alpha-beta": [1.12149, null], "PLL": [1.12153, null], "KF": [0.94739, null], "Huber KF": [0.94739, null], "EKF": [0.38091, null], "UKF": [0.38169, null], "RLS": [0.45347, null], "KF-reg": [0.46767, null], "SGD (author)": [0.53756, null]}, "thermal": {"LP readout": [1.67422, null], "alpha-beta": [1.6722, null], "PLL": [1.67219, null], "KF": [1.23705, null], "Huber KF": [1.23705, null], "EKF": [0.35915, null], "UKF": [0.35955, null], "RLS": [0.43829, null], "KF-reg": [0.41618, null], "SGD (author)": [0.40877, null]}}}, "v15": {"mild": {"static": {"KF": [0.63186, 0.9538], "Huber KF": [0.63169, 0.9538], "EKF": [0.25322, 0.9936], "UKF": [0.25321, 0.9936], "KF-biexp": [0.33735, 0.9887], "KF-reg": [0.35047, 0.9886], "SGD (author)": [0.2892, 0.9775], "SGD-biexp": [0.29941, 0.9763], "RLS": [0.30465, 0.9881], "alpha-beta": [0.72644, 0.9587], "Complementary": [0.39328, 0.9697], "PLL": [0.72644, 0.9587], "LP readout": [0.62659, 0.9523], "Zero-crossing": [4.30737, -0.2738], "FFT-peak": [26.08646, 0.0285]}, "dynamic": {"KF": [0.49004, 0.8209], "Huber KF": [0.49025, 0.8203], "EKF": [0.27809, 0.9082], "UKF": [0.27809, 0.9082], "KF-biexp": [0.34377, 0.8997], "KF-reg": [0.33234, 0.9081], "SGD (author)": [0.46155, 0.8197], "SGD-biexp": [0.46096, 0.8196], "RLS": [0.37288, 0.8775], "alpha-beta": [0.41054, 0.8732], "Complementary": [0.45988, 0.8193], "PLL": [0.41054, 0.8732], "LP readout": [0.49984, 0.8161], "Zero-crossing": [2.09768, 0.0755], "FFT-peak": [13.70627, 0.0221]}, "thermal": {"KF": [0.43262, 0.969], "Huber KF": [0.43193, 0.9691], "EKF": [0.27183, 0.9928], "UKF": [0.27184, 0.9928], "KF-biexp": [0.35554, 0.9873], "KF-reg": [0.36467, 0.9877], "SGD (author)": [0.30961, 0.9766], "SGD-biexp": [0.3069, 0.9767], "RLS": [0.32776, 0.9864], "alpha-beta": [0.48117, 0.9765], "Complementary": [0.30575, 0.9766], "PLL": [0.48117, 0.9765], "LP readout": [0.43576, 0.9672], "Zero-crossing": [4.21631, -0.1921], "FFT-peak": [26.14181, 0.0199]}}, "harsh": {"static": {"KF": [1.87514, -0.0807], "Huber KF": [1.87514, -0.0807], "EKF": [0.43925, 0.9886], "UKF": [0.44234, 0.9885], "KF-biexp": [0.63197, 0.9807], "KF-reg": [0.64955, 0.9795], "SGD (author)": [0.58957, 0.9736], "SGD-biexp": [0.58429, 0.9725], "RLS": [0.60714, 0.9816], "alpha-beta": [2.9521, -0.0691], "Complementary": [1.92444, 0.6797], "PLL": [2.95207, -0.0693], "LP readout": [2.95405, -0.0583], "Zero-crossing": [7.50638, -0.2976], "FFT-peak": [22.80915, -0.2405]}, "dynamic": {"KF": [0.9359, 0.2184], "Huber KF": [0.9359, 0.2184], "EKF": [0.35685, 0.8798], "UKF": [0.35697, 0.8798], "KF-biexp": [0.39229, 0.898], "KF-reg": [0.38625, 0.9059], "SGD (author)": [0.496, 0.8188], "SGD-biexp": [0.50135, 0.8173], "RLS": [0.41638, 0.8759], "alpha-beta": [0.92343, 0.3706], "Complementary": [0.49767, 0.8165], "PLL": [0.92347, 0.3704], "LP readout": [0.91815, 0.3984], "Zero-crossing": [2.63448, -0.1302], "FFT-peak": [13.16922, -0.0478]}, "thermal": {"KF": [1.23705, -0.0338], "Huber KF": [1.23705, -0.0338], "EKF": [0.33459, 0.9877], "UKF": [0.33463, 0.9877], "KF-biexp": [0.4655, 0.9812], "KF-reg": [0.48156, 0.981], "SGD (author)": [0.40877, 0.9695], "SGD-biexp": [0.41888, 0.9689], "RLS": [0.43829, 0.9805], "alpha-beta": [1.6722, 0.3194], "Complementary": [0.60384, 0.9428], "PLL": [1.67219, 0.3193], "LP readout": [1.67422, 0.3388], "Zero-crossing": [6.23803, -0.5314], "FFT-peak": [21.49732, 0.2248]}}}}''')
+REFERENCE = json.loads(r'''{"eval": {"mild": {"static": {"KF": {"norm": [0.61187, 0.61164, 0.60915, 0.60686, 0.60869, 0.61097, 0.60575], "mae": [0.03572, 0.03571, 0.03556, 0.03543, 0.03553, 0.03567, 0.03536], "rmse": [0.0424, 0.0424, 0.04213, 0.0419, 0.04193, 0.04231, 0.04191], "corr": [0.96212, 0.96409, 0.95977, 0.95723, 0.9722, 0.97063, 0.96862], "std_ratio": [1.06054, 1.03282, 1.04799, 1.06405, 1.05253, 1.05479, 1.04121], "w_frac": []}, "Huber KF": {"norm": [0.61189, 0.61166, 0.60919, 0.60688, 0.6087, 0.61098, 0.60574], "mae": [0.03572, 0.03571, 0.03556, 0.03543, 0.03553, 0.03567, 0.03536], "rmse": [0.0424, 0.0424, 0.04213, 0.0419, 0.04193, 0.04231, 0.0419], "corr": [0.96211, 0.96408, 0.95976, 0.95722, 0.9722, 0.97063, 0.96862], "std_ratio": [1.06058, 1.03286, 1.04801, 1.06408, 1.05257, 1.05481, 1.04122], "w_frac": [0.13374, 0.13519, 0.1346, 0.13271, 0.13358, 0.13342, 0.13458]}, "EKF": {"norm": [0.25495, 0.23986, 0.23646, 0.2379, 0.24303, 0.23541, 0.23024], "mae": [0.01488, 0.014, 0.0138, 0.01389, 0.01419, 0.01374, 0.01344], "rmse": [0.01859, 0.01751, 0.01716, 0.01756, 0.01785, 0.01725, 0.01685], "corr": [0.99419, 0.99492, 0.99513, 0.99544, 0.99416, 0.99391, 0.995], "std_ratio": [1.01059, 0.98454, 1.00336, 1.00799, 1.01695, 1.0221, 1.00585], "w_frac": []}, "UKF": {"norm": [0.25496, 0.23985, 0.23647, 0.2379, 0.24301, 0.23543, 0.23024], "mae": [0.01488, 0.014, 0.0138, 0.01389, 0.01419, 0.01374, 0.01344], "rmse": [0.01859, 0.01751, 0.01716, 0.01756, 0.01785, 0.01725, 0.01685], "corr": [0.99419, 0.99492, 0.99513, 0.99544, 0.99416, 0.99391, 0.995], "std_ratio": [1.0106, 0.98453, 1.00336, 1.00798, 1.01694, 1.0221, 1.00586], "w_frac": []}, "KF-biexp": {"norm": [0.30356, 0.29217, 0.2865, 0.28992, 0.2954, 0.29091, 0.28593], "mae": [0.01772, 0.01706, 0.01673, 0.01692, 0.01724, 0.01698, 0.01669], "rmse": [0.02219, 0.02136, 0.02089, 0.02124, 0.02163, 0.02125, 0.02094], "corr": [0.99148, 0.99143, 0.99215, 0.99227, 0.99088, 0.99019, 0.99147], "std_ratio": [1.00788, 0.9832, 1.00253, 1.00659, 1.01668, 1.02305, 0.99937], "w_frac": []}, "KF-reg": {"norm": [0.27332, 0.26109, 0.26261, 0.25976, 0.26864, 0.26924, 0.26214], "mae": [0.01596, 0.01524, 0.01533, 0.01516, 0.01568, 0.01572, 0.0153], "rmse": [0.01972, 0.01881, 0.01868, 0.01872, 0.0194, 0.01916, 0.01874], "corr": [0.9813, 0.98078, 0.98085, 0.98203, 0.9803, 0.97909, 0.98021], "std_ratio": [1.00376, 0.97868, 0.99582, 1.00198, 1.01193, 1.01566, 0.9956], "w_frac": []}, "SGD (author)": {"norm": [0.28362, 0.27248, 0.27983, 0.274, 0.28144, 0.28463, 0.27676], "mae": [0.01656, 0.01591, 0.01634, 0.016, 0.01643, 0.01662, 0.01616], "rmse": [0.0203, 0.0194, 0.01963, 0.01947, 0.02013, 0.01993, 0.01947], "corr": [0.97558, 0.97518, 0.97421, 0.97624, 0.97478, 0.97337, 0.97426], "std_ratio": [1.00443, 0.97909, 0.99312, 1.00145, 1.01178, 1.01375, 0.99715], "w_frac": []}, "SGD-biexp": {"norm": [0.28502, 0.27369, 0.28197, 0.27586, 0.28326, 0.28732, 0.27876], "mae": [0.01664, 0.01598, 0.01646, 0.0161, 0.01654, 0.01677, 0.01627], "rmse": [0.0204, 0.01949, 0.01975, 0.01958, 0.02022, 0.0201, 0.01957], "corr": [0.97519, 0.97508, 0.97382, 0.97593, 0.97456, 0.97297, 0.97389], "std_ratio": [1.00613, 0.98152, 0.99612, 1.00443, 1.0138, 1.01579, 0.99916], "w_frac": []}, "RLS": {"norm": [0.2819, 0.26951, 0.26563, 0.26689, 0.27409, 0.27146, 0.26565], "mae": [0.01646, 0.01573, 0.01551, 0.01558, 0.016, 0.01585, 0.01551], "rmse": [0.02056, 0.01968, 0.01929, 0.01953, 0.02001, 0.01972, 0.01937], "corr": [0.98892, 0.98863, 0.98926, 0.98973, 0.98807, 0.98707, 0.98837], "std_ratio": [1.0061, 0.98174, 1.00008, 1.00549, 1.01496, 1.02066, 0.99776], "w_frac": []}, "alpha-beta": {"norm": [0.58411, 0.58432, 0.58416, 0.58137, 0.58314, 0.58432, 0.57836], "mae": [0.0341, 0.03411, 0.0341, 0.03394, 0.03404, 0.03411, 0.03376], "rmse": [0.0408, 0.0408, 0.04068, 0.04042, 0.04043, 0.04083, 0.04038], "corr": [0.95366, 0.95479, 0.94979, 0.94847, 0.96145, 0.95969, 0.95831], "std_ratio": [1.05543, 1.02882, 1.04319, 1.05872, 1.04942, 1.05108, 1.03738], "w_frac": []}, "Complementary": {"norm": [0.38027, 0.3731, 0.37778, 0.3719, 0.37898, 0.37864, 0.37055], "mae": [0.0222, 0.02178, 0.02205, 0.02171, 0.02212, 0.0221, 0.02163], "rmse": [0.02704, 0.02667, 0.02666, 0.0263, 0.02667, 0.02687, 0.02631], "corr": [0.96996, 0.97162, 0.96804, 0.96911, 0.97267, 0.97101, 0.97104], "std_ratio": [1.02854, 1.00268, 1.01676, 1.02798, 1.02995, 1.03184, 1.01786], "w_frac": []}, "PLL": {"norm": [0.58412, 0.58432, 0.58417, 0.58137, 0.58314, 0.58432, 0.57836], "mae": [0.0341, 0.03411, 0.0341, 0.03394, 0.03404, 0.03411, 0.03376], "rmse": [0.0408, 0.0408, 0.04068, 0.04042, 0.04043, 0.04083, 0.04038], "corr": [0.95366, 0.95479, 0.94979, 0.94847, 0.96145, 0.95969, 0.95831], "std_ratio": [1.05543, 1.02882, 1.04319, 1.05872, 1.04942, 1.05108, 1.03738], "w_frac": []}, "LP readout": {"norm": [0.60655, 0.6061, 0.60429, 0.60181, 0.60356, 0.60576, 0.60044], "mae": [0.03541, 0.03538, 0.03528, 0.03513, 0.03523, 0.03536, 0.03505], "rmse": [0.0422, 0.04221, 0.04197, 0.04174, 0.04176, 0.04214, 0.04174], "corr": [0.96048, 0.96225, 0.95777, 0.95555, 0.96997, 0.96836, 0.9665], "std_ratio": [1.05886, 1.03142, 1.04645, 1.06229, 1.0514, 1.05356, 1.03994], "w_frac": []}, "Zero-crossing": {"norm": [4.04068, 4.24194, 4.17595, 4.32911, 4.27752, 4.4126, 4.26669], "mae": [0.23589, 0.24764, 0.24378, 0.25273, 0.24971, 0.2576, 0.24908], "rmse": [0.25866, 0.26595, 0.26459, 0.27013, 0.26797, 0.27423, 0.27085], "corr": [-0.17284, -0.13389, -0.6835, -0.49354, -0.63173, -0.2157, -0.33239], "std_ratio": [0.1948, 0.16593, 0.16554, 0.11794, 0.17751, 0.26473, 0.27439], "w_frac": []}, "FFT-peak": {"norm": [26.10704, 26.09402, 26.11894, 26.04558, 26.29232, 26.14457, 26.10317], "mae": [1.52408, 1.52332, 1.52477, 1.52049, 1.5349, 1.52627, 1.52385], "rmse": [1.88188, 1.8798, 1.88341, 1.87756, 1.89071, 1.88319, 1.88125], "corr": [0.04362, 0.04274, 0.02776, 0.03117, 0.02586, 0.03961, 0.01089], "std_ratio": [12.21073, 11.94228, 12.48888, 12.35935, 12.09229, 12.70908, 12.29379], "w_frac": []}, "_ns": [0.05838, 0.05838, 0.05838, 0.05838, 0.05838, 0.05838, 0.05838]}, "dynamic": {"KF": {"norm": [0.48656, 0.49378, 0.48048, 0.49379, 0.48933, 0.49296, 0.4906], "mae": [0.05484, 0.05565, 0.05415, 0.05565, 0.05515, 0.05556, 0.05529], "rmse": [0.08723, 0.08743, 0.08618, 0.0874, 0.08711, 0.0872, 0.08717], "corr": [0.81771, 0.816, 0.82302, 0.81629, 0.81945, 0.81806, 0.81883], "std_ratio": [0.84845, 0.84344, 0.83692, 0.8478, 0.84765, 0.84395, 0.84201], "w_frac": []}, "Huber KF": {"norm": [0.48665, 0.49388, 0.48057, 0.49391, 0.48943, 0.49306, 0.4907], "mae": [0.05485, 0.05566, 0.05416, 0.05567, 0.05516, 0.05557, 0.05531], "rmse": [0.08727, 0.08747, 0.08622, 0.08744, 0.08715, 0.08724, 0.08721], "corr": [0.81751, 0.81581, 0.82283, 0.81608, 0.81925, 0.81787, 0.81862], "std_ratio": [0.84855, 0.84352, 0.837, 0.84788, 0.84774, 0.84405, 0.84209], "w_frac": [0.12694, 0.12659, 0.12762, 0.12668, 0.12691, 0.12687, 0.1265]}, "EKF": {"norm": [0.27619, 0.26953, 0.2655, 0.27403, 0.27189, 0.27593, 0.26882], "mae": [0.03113, 0.03038, 0.02992, 0.03088, 0.03064, 0.0311, 0.0303], "rmse": [0.06367, 0.06289, 0.06283, 0.06337, 0.0633, 0.06376, 0.06338], "corr": [0.90793, 0.90923, 0.90927, 0.90808, 0.90844, 0.90662, 0.90742], "std_ratio": [0.93535, 0.92708, 0.93001, 0.9333, 0.93643, 0.93157, 0.9275], "w_frac": []}, "UKF": {"norm": [0.27619, 0.26953, 0.2655, 0.27402, 0.27188, 0.27593, 0.26881], "mae": [0.03113, 0.03038, 0.02992, 0.03088, 0.03064, 0.0311, 0.0303], "rmse": [0.06367, 0.06289, 0.06283, 0.06337, 0.0633, 0.06376, 0.06338], "corr": [0.90793, 0.90923, 0.90927, 0.90808, 0.90844, 0.90662, 0.90742], "std_ratio": [0.93535, 0.92708, 0.93001, 0.9333, 0.93643, 0.93156, 0.9275], "w_frac": []}, "KF-biexp": {"norm": [0.32839, 0.32231, 0.31865, 0.32801, 0.32504, 0.32898, 0.32385], "mae": [0.03701, 0.03633, 0.03591, 0.03697, 0.03663, 0.03708, 0.0365], "rmse": [0.0671, 0.06632, 0.06628, 0.06705, 0.06668, 0.0672, 0.06716], "corr": [0.89921, 0.90094, 0.90082, 0.89864, 0.90007, 0.898, 0.89795], "std_ratio": [0.90868, 0.89917, 0.90201, 0.90584, 0.90827, 0.90305, 0.89957], "w_frac": []}, "KF-reg": {"norm": [0.42478, 0.41934, 0.41566, 0.42532, 0.42191, 0.42848, 0.42181], "mae": [0.04788, 0.04726, 0.04685, 0.04794, 0.04755, 0.04829, 0.04754], "rmse": [0.08152, 0.08075, 0.08079, 0.08147, 0.08092, 0.08156, 0.08153], "corr": [0.8374, 0.83962, 0.83948, 0.83671, 0.83964, 0.83645, 0.83621], "std_ratio": [0.84533, 0.83616, 0.83887, 0.84328, 0.8452, 0.84063, 0.83666], "w_frac": []}, "SGD (author)": {"norm": [0.46057, 0.45458, 0.45157, 0.46082, 0.45669, 0.46436, 0.45746], "mae": [0.05191, 0.05123, 0.05089, 0.05194, 0.05147, 0.05234, 0.05156], "rmse": [0.08571, 0.08494, 0.08502, 0.08565, 0.08507, 0.08579, 0.08564], "corr": [0.81735, 0.81956, 0.81936, 0.81663, 0.82004, 0.81621, 0.81642], "std_ratio": [0.82349, 0.81438, 0.81774, 0.82149, 0.82398, 0.81892, 0.81528], "w_frac": []}, "SGD-biexp": {"norm": [0.46014, 0.45443, 0.45141, 0.46043, 0.45658, 0.46405, 0.45733], "mae": [0.05186, 0.05122, 0.05088, 0.05189, 0.05146, 0.0523, 0.05154], "rmse": [0.0857, 0.08495, 0.08503, 0.08564, 0.08509, 0.08577, 0.08565], "corr": [0.81731, 0.81946, 0.81923, 0.81659, 0.81986, 0.81618, 0.81628], "std_ratio": [0.82375, 0.81453, 0.81798, 0.82166, 0.82428, 0.81942, 0.81591], "w_frac": []}, "RLS": {"norm": [0.3603, 0.35523, 0.35104, 0.36077, 0.35788, 0.3625, 0.35714], "mae": [0.04061, 0.04004, 0.03956, 0.04066, 0.04034, 0.04086, 0.04025], "rmse": [0.07271, 0.07194, 0.07192, 0.07266, 0.07223, 0.07273, 0.0728], "corr": [0.87648, 0.87841, 0.87827, 0.87583, 0.87771, 0.87552, 0.87509], "std_ratio": [0.88562, 0.87615, 0.87852, 0.8829, 0.88461, 0.88049, 0.87644], "w_frac": []}, "alpha-beta": {"norm": [0.53454, 0.54289, 0.52963, 0.54214, 0.53886, 0.54302, 0.54003], "mae": [0.06025, 0.06119, 0.05969, 0.0611, 0.06073, 0.0612, 0.06087], "rmse": [0.09488, 0.09509, 0.09381, 0.09499, 0.09473, 0.09486, 0.0948], "corr": [0.77636, 0.77434, 0.78201, 0.77522, 0.77839, 0.77656, 0.77731], "std_ratio": [0.82615, 0.82187, 0.81568, 0.82706, 0.82586, 0.82193, 0.81994], "w_frac": []}, "Complementary": {"norm": [0.45802, 0.45303, 0.44961, 0.45804, 0.45569, 0.46197, 0.45593], "mae": [0.05162, 0.05106, 0.05067, 0.05162, 0.05136, 0.05207, 0.05139], "rmse": [0.08556, 0.08492, 0.08497, 0.08546, 0.0851, 0.08569, 0.08559], "corr": [0.8177, 0.81951, 0.81927, 0.81724, 0.81961, 0.81638, 0.81632], "std_ratio": [0.82413, 0.81533, 0.81895, 0.82247, 0.82473, 0.82164, 0.81843], "w_frac": []}, "PLL": {"norm": [0.53455, 0.5429, 0.52963, 0.54214, 0.53886, 0.54303, 0.54004], "mae": [0.06025, 0.06119, 0.05969, 0.0611, 0.06073, 0.0612, 0.06087], "rmse": [0.09489, 0.09509, 0.09381, 0.09499, 0.09473, 0.09486, 0.09481], "corr": [0.77635, 0.77433, 0.782, 0.77521, 0.77838, 0.77655, 0.7773], "std_ratio": [0.82615, 0.82188, 0.81569, 0.82707, 0.82587, 0.82194, 0.81995], "w_frac": []}, "LP readout": {"norm": [0.49584, 0.50323, 0.49007, 0.50304, 0.49883, 0.50249, 0.50007], "mae": [0.05588, 0.05672, 0.05523, 0.0567, 0.05622, 0.05663, 0.05636], "rmse": [0.08824, 0.08846, 0.08722, 0.08843, 0.08813, 0.08823, 0.08819], "corr": [0.8129, 0.81105, 0.81815, 0.81136, 0.81462, 0.81318, 0.81392], "std_ratio": [0.84153, 0.83674, 0.83037, 0.84137, 0.8409, 0.83714, 0.83518], "w_frac": []}, "Zero-crossing": {"norm": [2.26697, 2.15732, 2.26336, 2.08611, 2.15238, 2.02661, 2.19623], "mae": [0.2555, 0.24314, 0.25509, 0.23512, 0.24259, 0.22841, 0.24753], "rmse": [0.30828, 0.2926, 0.30343, 0.27945, 0.28966, 0.27091, 0.29525], "corr": [-0.62528, -0.40805, -0.64635, 0.29382, -0.29425, 0.47816, 0.01094], "std_ratio": [0.12486, 0.09041, 0.20376, 0.09301, 0.14606, 0.29837, 0.11878], "w_frac": []}, "FFT-peak": {"norm": [13.56528, 13.57525, 13.58193, 13.71149, 13.54978, 13.67005, 13.42987], "mae": [1.52889, 1.53002, 1.53077, 1.54537, 1.52714, 1.5407, 1.51363], "rmse": [1.89025, 1.89155, 1.893, 1.90673, 1.88743, 1.90114, 1.87193], "corr": [0.06761, 0.05967, 0.05893, 0.01943, 0.06258, 0.00545, 0.10244], "std_ratio": [5.50494, 5.43632, 5.70306, 5.54757, 5.50807, 5.8947, 5.76913], "w_frac": []}, "_ns": [0.11271, 0.11271, 0.11271, 0.11271, 0.11271, 0.11271, 0.11271]}, "thermal": {"KF": {"norm": [0.3763, 0.36873, 0.37144, 0.36575, 0.37313, 0.37223, 0.37409], "mae": [0.02197, 0.02153, 0.02168, 0.02135, 0.02178, 0.02173, 0.02184], "rmse": [0.02675, 0.02624, 0.02639, 0.02593, 0.02644, 0.02653, 0.0266], "corr": [0.9737, 0.97594, 0.97419, 0.97659, 0.97774, 0.97513, 0.97333], "std_ratio": [1.0082, 0.98553, 1.00699, 1.01265, 1.01616, 1.017, 1.00616], "w_frac": []}, "Huber KF": {"norm": [0.37615, 0.36858, 0.3713, 0.36557, 0.37297, 0.37211, 0.37392], "mae": [0.02196, 0.02152, 0.02168, 0.02134, 0.02177, 0.02172, 0.02183], "rmse": [0.02674, 0.02623, 0.02638, 0.02592, 0.02643, 0.02651, 0.02659], "corr": [0.9737, 0.97594, 0.97419, 0.97659, 0.97774, 0.97513, 0.97333], "std_ratio": [1.00823, 0.98556, 1.00701, 1.01267, 1.01619, 1.01702, 1.00617], "w_frac": [0.12581, 0.12618, 0.12672, 0.12444, 0.12571, 0.12525, 0.12576]}, "EKF": {"norm": [0.23112, 0.22041, 0.21156, 0.21384, 0.22315, 0.22016, 0.2133], "mae": [0.01349, 0.01287, 0.01235, 0.01248, 0.01303, 0.01285, 0.01245], "rmse": [0.01705, 0.01613, 0.0153, 0.01575, 0.01627, 0.0162, 0.01558], "corr": [0.99483, 0.99514, 0.99529, 0.99592, 0.99476, 0.99428, 0.99487], "std_ratio": [1.00379, 0.98277, 1.00163, 1.00473, 1.01354, 1.01707, 1.00132], "w_frac": []}, "UKF": {"norm": [0.23113, 0.22041, 0.21157, 0.21384, 0.22315, 0.22017, 0.2133], "mae": [0.01349, 0.01287, 0.01235, 0.01248, 0.01303, 0.01285, 0.01245], "rmse": [0.01705, 0.01613, 0.0153, 0.01575, 0.01627, 0.0162, 0.01557], "corr": [0.99483, 0.99514, 0.99529, 0.99592, 0.99476, 0.99428, 0.99487], "std_ratio": [1.00379, 0.98277, 1.00163, 1.00473, 1.01353, 1.01707, 1.00133], "w_frac": []}, "KF-biexp": {"norm": [0.28858, 0.27924, 0.27099, 0.27289, 0.27866, 0.27858, 0.27577], "mae": [0.01685, 0.0163, 0.01582, 0.01593, 0.01627, 0.01626, 0.0161], "rmse": [0.02111, 0.02043, 0.01973, 0.02, 0.02039, 0.0204, 0.02017], "corr": [0.99164, 0.99192, 0.99214, 0.99285, 0.99205, 0.9911, 0.99123], "std_ratio": [1.0061, 0.98145, 0.99978, 1.005, 1.01526, 1.0177, 0.99925], "w_frac": []}, "KF-reg": {"norm": [0.26386, 0.251, 0.24917, 0.24716, 0.25617, 0.25803, 0.25453], "mae": [0.0154, 0.01465, 0.01455, 0.01443, 0.01495, 0.01506, 0.01486], "rmse": [0.01897, 0.01802, 0.01765, 0.01769, 0.01838, 0.01844, 0.01811], "corr": [0.98088, 0.98106, 0.98089, 0.98245, 0.98114, 0.97993, 0.97976], "std_ratio": [0.99973, 0.97594, 0.99331, 0.99893, 1.00948, 1.01075, 0.99395], "w_frac": []}, "SGD (author)": {"norm": [0.27771, 0.265, 0.26639, 0.26301, 0.27219, 0.27492, 0.2696], "mae": [0.01621, 0.01547, 0.01555, 0.01535, 0.01589, 0.01605, 0.01574], "rmse": [0.01972, 0.01867, 0.01857, 0.01846, 0.01922, 0.01929, 0.01884], "corr": [0.97488, 0.97505, 0.97446, 0.97645, 0.97505, 0.97368, 0.97379], "std_ratio": [0.99604, 0.97241, 0.98985, 0.99538, 1.00608, 1.00651, 0.99148], "w_frac": []}, "SGD-biexp": {"norm": [0.27695, 0.26466, 0.26559, 0.26215, 0.27206, 0.27497, 0.2696], "mae": [0.01617, 0.01545, 0.0155, 0.0153, 0.01588, 0.01605, 0.01574], "rmse": [0.01967, 0.01864, 0.0185, 0.01839, 0.0192, 0.01927, 0.01883], "corr": [0.97489, 0.97502, 0.97454, 0.97651, 0.97498, 0.97355, 0.97369], "std_ratio": [0.99603, 0.97258, 0.99055, 0.99584, 1.00622, 1.00684, 0.99213], "w_frac": []}, "RLS": {"norm": [0.26741, 0.25687, 0.25008, 0.25011, 0.25846, 0.25881, 0.25611], "mae": [0.01561, 0.015, 0.0146, 0.0146, 0.01509, 0.01511, 0.01495], "rmse": [0.01952, 0.01878, 0.01812, 0.01829, 0.01884, 0.01887, 0.01865], "corr": [0.9889, 0.98909, 0.98931, 0.9903, 0.98918, 0.98805, 0.98806], "std_ratio": [1.00453, 0.98045, 0.99818, 1.00356, 1.01371, 1.01645, 0.99872], "w_frac": []}, "alpha-beta": {"norm": [0.37508, 0.36899, 0.37272, 0.36549, 0.37529, 0.37386, 0.37449], "mae": [0.0219, 0.02154, 0.02176, 0.02134, 0.02191, 0.02183, 0.02186], "rmse": [0.02686, 0.02637, 0.02664, 0.02612, 0.02668, 0.02681, 0.0268], "corr": [0.96463, 0.96612, 0.96392, 0.96697, 0.96746, 0.96485, 0.96334], "std_ratio": [1.00456, 0.98272, 1.00307, 1.0092, 1.0131, 1.01336, 1.00252], "w_frac": []}, "Complementary": {"norm": [0.27298, 0.26166, 0.26184, 0.25787, 0.27157, 0.27412, 0.26746], "mae": [0.01594, 0.01528, 0.01529, 0.01505, 0.01585, 0.016, 0.01561], "rmse": [0.01942, 0.01841, 0.01823, 0.01809, 0.01914, 0.01917, 0.01864], "corr": [0.97545, 0.97549, 0.97523, 0.97718, 0.9751, 0.97344, 0.97401], "std_ratio": [0.99581, 0.97408, 0.99282, 0.99756, 1.00668, 1.00798, 0.99536], "w_frac": []}, "PLL": {"norm": [0.37509, 0.36899, 0.37272, 0.3655, 0.37529, 0.37386, 0.37449], "mae": [0.0219, 0.02154, 0.02176, 0.02134, 0.02191, 0.02183, 0.02186], "rmse": [0.02686, 0.02637, 0.02664, 0.02612, 0.02668, 0.02681, 0.0268], "corr": [0.96463, 0.96612, 0.96392, 0.96697, 0.96746, 0.96485, 0.96334], "std_ratio": [1.00456, 0.98272, 1.00307, 1.0092, 1.0131, 1.01336, 1.00252], "w_frac": []}, "LP readout": {"norm": [0.38062, 0.37371, 0.3765, 0.37054, 0.37819, 0.37739, 0.37921], "mae": [0.02222, 0.02182, 0.02198, 0.02163, 0.02208, 0.02203, 0.02214], "rmse": [0.02717, 0.02668, 0.02685, 0.02638, 0.02689, 0.02699, 0.02704], "corr": [0.97185, 0.9739, 0.97206, 0.9746, 0.97558, 0.97298, 0.97126], "std_ratio": [1.00698, 0.98449, 1.00572, 1.01145, 1.01508, 1.01582, 1.00498], "w_frac": []}, "Zero-crossing": {"norm": [4.09314, 3.98356, 3.50885, 3.79732, 3.73726, 3.668, 4.1588], "mae": [0.23895, 0.23255, 0.20484, 0.22168, 0.21817, 0.21413, 0.24278], "rmse": [0.26342, 0.25564, 0.2268, 0.24499, 0.24244, 0.23654, 0.26228], "corr": [-0.45149, -0.10059, -0.59022, -0.15572, -0.21335, 0.56574, 0.31824], "std_ratio": [0.25432, 0.17495, 0.34587, 0.30568, 0.3649, 0.35121, 0.34319], "w_frac": []}, "FFT-peak": {"norm": [26.29292, 26.42329, 26.38091, 26.3607, 26.31637, 26.36676, 26.37419], "mae": [1.53493, 1.54254, 1.54007, 1.53889, 1.5363, 1.53924, 1.53968], "rmse": [1.88991, 1.89982, 1.89856, 1.90079, 1.895, 1.89655, 1.89498], "corr": [0.02227, 0.01103, 0.01919, 0.00824, 0.01658, 0.00802, 0.02029], "std_ratio": [12.28143, 11.82582, 12.34816, 12.27334, 12.26837, 12.70092, 12.26974], "w_frac": []}, "_ns": [0.05838, 0.05838, 0.05838, 0.05838, 0.05838, 0.05838, 0.05838]}}, "harsh": {"static": {"KF": {"norm": [1.75585, 1.82868, 1.84507, 1.84372, 1.77672, 1.76946, 1.75618], "mae": [0.1025, 0.10676, 0.10771, 0.10763, 0.10372, 0.1033, 0.10252], "rmse": [0.12411, 0.12946, 0.13013, 0.13009, 0.1251, 0.12496, 0.12431], "corr": [-0.08824, -0.09378, -0.09208, -0.08374, -0.08356, -0.08698, -0.09955], "std_ratio": [0.88208, 0.92514, 0.9125, 0.92281, 0.9069, 0.88074, 0.8761], "w_frac": []}, "Huber KF": {"norm": [1.75585, 1.82868, 1.84507, 1.84372, 1.77672, 1.76946, 1.75618], "mae": [0.1025, 0.10676, 0.10771, 0.10763, 0.10372, 0.1033, 0.10252], "rmse": [0.12411, 0.12946, 0.13013, 0.13009, 0.1251, 0.12496, 0.12431], "corr": [-0.08824, -0.09378, -0.09208, -0.08374, -0.08356, -0.08698, -0.09955], "std_ratio": [0.88208, 0.92514, 0.9125, 0.92281, 0.9069, 0.88074, 0.8761], "w_frac": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}, "EKF": {"norm": [0.40828, 0.39831, 0.49401, 0.45349, 0.39205, 0.34768, 0.39134], "mae": [0.02383, 0.02325, 0.02884, 0.02647, 0.02289, 0.0203, 0.02285], "rmse": [0.03161, 0.0303, 0.03708, 0.03468, 0.03006, 0.02597, 0.0303], "corr": [0.98846, 0.99006, 0.98286, 0.98542, 0.98971, 0.9899, 0.98676], "std_ratio": [0.97355, 0.95775, 1.08228, 1.09729, 1.01765, 1.00455, 1.05969], "w_frac": []}, "UKF": {"norm": [0.41076, 0.40063, 0.49831, 0.45724, 0.39464, 0.3495, 0.3939], "mae": [0.02398, 0.02339, 0.02909, 0.02669, 0.02304, 0.0204, 0.023], "rmse": [0.03182, 0.0305, 0.03741, 0.03499, 0.03029, 0.02611, 0.03053], "corr": [0.98841, 0.99007, 0.98276, 0.98532, 0.98967, 0.98991, 0.98669], "std_ratio": [0.97407, 0.95825, 1.08346, 1.09833, 1.01827, 1.00487, 1.06048], "w_frac": []}, "KF-biexp": {"norm": [0.54256, 0.52785, 0.65009, 0.58836, 0.51336, 0.46674, 0.50616], "mae": [0.03167, 0.03082, 0.03795, 0.03435, 0.02997, 0.02725, 0.02955], "rmse": [0.0401, 0.03856, 0.04677, 0.04316, 0.03803, 0.03335, 0.0376], "corr": [0.97522, 0.97876, 0.96702, 0.97146, 0.97957, 0.97693, 0.97216], "std_ratio": [0.93511, 0.91185, 1.08042, 1.11095, 0.99494, 0.97257, 1.04841], "w_frac": []}, "KF-reg": {"norm": [0.54534, 0.53358, 0.65565, 0.59697, 0.51803, 0.47206, 0.51258], "mae": [0.03184, 0.03115, 0.03828, 0.03485, 0.03024, 0.02756, 0.02992], "rmse": [0.04026, 0.03901, 0.04714, 0.04363, 0.03829, 0.03381, 0.038], "corr": [0.9759, 0.97865, 0.96799, 0.97211, 0.97988, 0.97651, 0.97227], "std_ratio": [0.93843, 0.9175, 1.08889, 1.11904, 1.00003, 0.97669, 1.05174], "w_frac": []}, "SGD (author)": {"norm": [0.49162, 0.4657, 0.57628, 0.52166, 0.4654, 0.42798, 0.47026], "mae": [0.0287, 0.02719, 0.03364, 0.03045, 0.02717, 0.02498, 0.02745], "rmse": [0.03611, 0.03408, 0.0414, 0.03821, 0.03417, 0.03044, 0.03433], "corr": [0.96394, 0.97074, 0.9563, 0.9623, 0.96981, 0.96987, 0.96132], "std_ratio": [0.93262, 0.9226, 1.05453, 1.08128, 0.98957, 0.96368, 1.03116], "w_frac": []}, "SGD-biexp": {"norm": [0.53241, 0.51252, 0.63597, 0.57505, 0.50413, 0.46014, 0.50602], "mae": [0.03108, 0.02992, 0.03713, 0.03357, 0.02943, 0.02686, 0.02954], "rmse": [0.03915, 0.03732, 0.04567, 0.04208, 0.03712, 0.03266, 0.03709], "corr": [0.96594, 0.97123, 0.95686, 0.96317, 0.9714, 0.97006, 0.96226], "std_ratio": [0.93151, 0.9119, 1.0681, 1.09788, 0.99151, 0.96628, 1.03979], "w_frac": []}, "RLS": {"norm": [0.55798, 0.54543, 0.66782, 0.59964, 0.53041, 0.47406, 0.51314], "mae": [0.03257, 0.03184, 0.03899, 0.03501, 0.03096, 0.02767, 0.02996], "rmse": [0.04167, 0.04022, 0.04821, 0.04443, 0.03961, 0.03443, 0.03868], "corr": [0.98236, 0.98517, 0.97572, 0.97903, 0.98744, 0.98436, 0.98192], "std_ratio": [0.93631, 0.90921, 1.07705, 1.10745, 0.99311, 0.97448, 1.04898], "w_frac": []}, "alpha-beta": {"norm": [2.7967, 2.89238, 2.89646, 2.90259, 2.82405, 2.80624, 2.79016], "mae": [0.16327, 0.16885, 0.16909, 0.16945, 0.16486, 0.16382, 0.16288], "rmse": [0.18928, 0.19527, 0.19503, 0.19522, 0.19051, 0.18953, 0.18931], "corr": [-0.08486, -0.11035, -0.07689, -0.06305, -0.05998, -0.06784, -0.11305], "std_ratio": [1.00599, 1.00068, 1.00899, 1.00587, 1.02229, 1.00875, 1.00557], "w_frac": []}, "Complementary": {"norm": [1.77875, 1.81633, 1.9383, 1.94791, 1.81934, 1.7709, 1.87544], "mae": [0.10384, 0.10603, 0.11315, 0.11372, 0.10621, 0.10338, 0.10948], "rmse": [0.1181, 0.11998, 0.12698, 0.12728, 0.11946, 0.11636, 0.12323], "corr": [0.63873, 0.64077, 0.67387, 0.69227, 0.66958, 0.6608, 0.6413], "std_ratio": [1.26462, 1.2535, 1.39071, 1.37864, 1.3132, 1.30564, 1.33196], "w_frac": []}, "PLL": {"norm": [2.79667, 2.89234, 2.89643, 2.90256, 2.82403, 2.80622, 2.79013], "mae": [0.16326, 0.16885, 0.16909, 0.16945, 0.16486, 0.16382, 0.16288], "rmse": [0.18928, 0.19527, 0.19504, 0.19522, 0.19052, 0.18953, 0.18931], "corr": [-0.08501, -0.1105, -0.07705, -0.06321, -0.06013, -0.068, -0.1132], "std_ratio": [1.00606, 1.00076, 1.00907, 1.00595, 1.02236, 1.00882, 1.00564], "w_frac": []}, "LP readout": {"norm": [2.79898, 2.89549, 2.89919, 2.90567, 2.8263, 2.80831, 2.79239], "mae": [0.1634, 0.16903, 0.16925, 0.16963, 0.16499, 0.16394, 0.16301], "rmse": [0.18889, 0.19485, 0.19462, 0.19481, 0.1901, 0.18913, 0.18892], "corr": [-0.07401, -0.09917, -0.06508, -0.05139, -0.04862, -0.05658, -0.10218], "std_ratio": [0.98747, 0.98175, 0.99009, 0.98683, 1.00366, 0.9903, 0.98714], "w_frac": []}, "Zero-crossing": {"norm": [6.88997, 7.42662, 7.4065, 7.77755, 7.17459, 7.55529, 7.146], "mae": [0.40222, 0.43355, 0.43238, 0.45404, 0.41884, 0.44106, 0.41717], "rmse": [0.43319, 0.45753, 0.45521, 0.47458, 0.44597, 0.46318, 0.44262], "corr": [-0.28848, -0.35043, -0.39249, -0.32582, -0.30785, -0.27369, -0.26504], "std_ratio": [1.51811, 1.46505, 1.39539, 1.35178, 1.59036, 1.46991, 1.55911], "w_frac": []}, "FFT-peak": {"norm": [21.84304, 21.37415, 24.00997, 24.03507, 22.29291, 21.5907, 23.50515], "mae": [1.27516, 1.24778, 1.40166, 1.40312, 1.30142, 1.26042, 1.37219], "rmse": [1.60923, 1.57602, 1.75605, 1.75011, 1.63935, 1.59001, 1.71807], "corr": [-0.18143, -0.13848, -0.28976, -0.30665, -0.20114, -0.18227, -0.31172], "std_ratio": [15.11877, 15.06058, 15.51335, 15.82216, 15.52245, 15.88599, 16.23813], "w_frac": []}, "_ns": [0.05838, 0.05838, 0.05838, 0.05838, 0.05838, 0.05838, 0.05838]}, "dynamic": {"KF": {"norm": [0.92752, 0.93013, 0.93537, 0.94058, 0.935, 0.93161, 0.92911], "mae": [0.10454, 0.10483, 0.10542, 0.10601, 0.10538, 0.105, 0.10472], "rmse": [0.1434, 0.14353, 0.14352, 0.14424, 0.14379, 0.14365, 0.14348], "corr": [0.25312, 0.23307, 0.24269, 0.21124, 0.23371, 0.23917, 0.24843], "std_ratio": [0.14442, 0.15637, 0.14285, 0.1474, 0.1473, 0.14397, 0.13895], "w_frac": []}, "Huber KF": {"norm": [0.92752, 0.93013, 0.93537, 0.94058, 0.935, 0.93161, 0.92911], "mae": [0.10454, 0.10483, 0.10542, 0.10601, 0.10538, 0.105, 0.10472], "rmse": [0.1434, 0.14353, 0.14352, 0.14424, 0.14379, 0.14365, 0.14348], "corr": [0.25312, 0.23307, 0.24269, 0.21124, 0.23371, 0.23917, 0.24843], "std_ratio": [0.14442, 0.15637, 0.14285, 0.1474, 0.1473, 0.14397, 0.13895], "w_frac": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}, "EKF": {"norm": [0.34155, 0.34173, 0.35942, 0.35962, 0.34389, 0.34035, 0.34258], "mae": [0.0385, 0.03852, 0.04051, 0.04053, 0.03876, 0.03836, 0.03861], "rmse": [0.07224, 0.07143, 0.07309, 0.07365, 0.07184, 0.07172, 0.07238], "corr": [0.88189, 0.88368, 0.87906, 0.87601, 0.88211, 0.88087, 0.87946], "std_ratio": [0.90867, 0.89817, 0.90875, 0.91553, 0.90626, 0.90149, 0.91057], "w_frac": []}, "UKF": {"norm": [0.34167, 0.34185, 0.35958, 0.35976, 0.344, 0.34045, 0.34268], "mae": [0.03851, 0.03853, 0.04053, 0.04055, 0.03877, 0.03837, 0.03862], "rmse": [0.07225, 0.07144, 0.0731, 0.07366, 0.07184, 0.07172, 0.07239], "corr": [0.88188, 0.88368, 0.87905, 0.876, 0.88211, 0.88086, 0.87946], "std_ratio": [0.90875, 0.89822, 0.90881, 0.9156, 0.90633, 0.90154, 0.91063], "w_frac": []}, "KF-biexp": {"norm": [0.44535, 0.44519, 0.47039, 0.46819, 0.44672, 0.44632, 0.44987], "mae": [0.05019, 0.05018, 0.05302, 0.05277, 0.05035, 0.0503, 0.0507], "rmse": [0.08276, 0.08216, 0.08404, 0.08465, 0.08252, 0.08256, 0.08322], "corr": [0.83977, 0.84158, 0.83584, 0.83029, 0.8395, 0.83689, 0.83519], "std_ratio": [0.83921, 0.82705, 0.84434, 0.85732, 0.83859, 0.83176, 0.84738], "w_frac": []}, "KF-reg": {"norm": [0.44474, 0.44493, 0.47056, 0.46773, 0.44605, 0.4455, 0.449], "mae": [0.05013, 0.05015, 0.05303, 0.05272, 0.05027, 0.05021, 0.05061], "rmse": [0.08266, 0.08209, 0.08398, 0.08456, 0.08241, 0.08242, 0.08308], "corr": [0.84027, 0.84202, 0.83632, 0.83081, 0.84009, 0.83761, 0.83584], "std_ratio": [0.83953, 0.82742, 0.84433, 0.85767, 0.83862, 0.83181, 0.84766], "w_frac": []}, "SGD (author)": {"norm": [0.48834, 0.48332, 0.50846, 0.50957, 0.48919, 0.49264, 0.4932], "mae": [0.05504, 0.05447, 0.05731, 0.05743, 0.05513, 0.05552, 0.05559], "rmse": [0.08838, 0.08767, 0.08916, 0.09006, 0.08804, 0.08827, 0.08863], "corr": [0.81059, 0.81234, 0.80703, 0.80075, 0.81131, 0.80793, 0.80673], "std_ratio": [0.80981, 0.79941, 0.80955, 0.82087, 0.80646, 0.80156, 0.81396], "w_frac": []}, "SGD-biexp": {"norm": [0.48051, 0.47704, 0.50246, 0.50154, 0.48072, 0.48254, 0.48566], "mae": [0.05416, 0.05377, 0.05663, 0.05653, 0.05418, 0.05438, 0.05474], "rmse": [0.08721, 0.08655, 0.08828, 0.08892, 0.08691, 0.08708, 0.08765], "corr": [0.81704, 0.81895, 0.813, 0.80732, 0.8175, 0.81418, 0.81243], "std_ratio": [0.81523, 0.80414, 0.81923, 0.83083, 0.81503, 0.80761, 0.82233], "w_frac": []}, "RLS": {"norm": [0.3911, 0.39268, 0.41572, 0.41052, 0.3924, 0.38703, 0.39099], "mae": [0.04408, 0.04426, 0.04685, 0.04627, 0.04423, 0.04362, 0.04407], "rmse": [0.07451, 0.07385, 0.07585, 0.0764, 0.0743, 0.07415, 0.07478], "corr": [0.87878, 0.88043, 0.87571, 0.87063, 0.87786, 0.87577, 0.87493], "std_ratio": [0.87962, 0.86716, 0.88392, 0.89698, 0.87801, 0.87215, 0.8866], "w_frac": []}, "alpha-beta": {"norm": [0.90897, 0.91352, 0.90953, 0.91982, 0.90865, 0.91193, 0.9093], "mae": [0.10245, 0.10296, 0.10251, 0.10367, 0.10241, 0.10278, 0.10248], "rmse": [0.14097, 0.14198, 0.14074, 0.14224, 0.14118, 0.14171, 0.1412], "corr": [0.40257, 0.39568, 0.40648, 0.36596, 0.38771, 0.38911, 0.39796], "std_ratio": [0.35534, 0.33743, 0.33742, 0.33759, 0.34816, 0.35998, 0.34321], "w_frac": []}, "Complementary": {"norm": [0.48011, 0.47626, 0.50277, 0.50116, 0.47761, 0.47864, 0.48114], "mae": [0.05411, 0.05368, 0.05667, 0.05648, 0.05383, 0.05395, 0.05423], "rmse": [0.08684, 0.0861, 0.08812, 0.08852, 0.08642, 0.08638, 0.08698], "corr": [0.81992, 0.82256, 0.81573, 0.81089, 0.82079, 0.81834, 0.81624], "std_ratio": [0.81881, 0.80611, 0.82491, 0.84039, 0.81807, 0.81095, 0.82886], "w_frac": []}, "PLL": {"norm": [0.909, 0.91356, 0.90956, 0.91986, 0.90868, 0.91197, 0.90934], "mae": [0.10245, 0.10296, 0.10251, 0.10367, 0.10241, 0.10278, 0.10249], "rmse": [0.14098, 0.14198, 0.14075, 0.14225, 0.14119, 0.14171, 0.14121], "corr": [0.4024, 0.39549, 0.40632, 0.36579, 0.38754, 0.38895, 0.39778], "std_ratio": [0.35535, 0.33744, 0.33742, 0.3376, 0.34817, 0.35998, 0.34322], "w_frac": []}, "LP readout": {"norm": [0.90431, 0.90882, 0.90487, 0.91543, 0.90425, 0.90715, 0.905], "mae": [0.10192, 0.10243, 0.10198, 0.10317, 0.10191, 0.10224, 0.102], "rmse": [0.1398, 0.1408, 0.13963, 0.14111, 0.14, 0.14054, 0.14007], "corr": [0.4284, 0.42328, 0.4322, 0.3919, 0.41375, 0.41441, 0.42406], "std_ratio": [0.35146, 0.3335, 0.33372, 0.33398, 0.34438, 0.35603, 0.3395], "w_frac": []}, "Zero-crossing": {"norm": [2.49363, 2.57058, 2.63884, 2.63796, 2.71238, 2.64443, 2.53626], "mae": [0.28105, 0.28972, 0.29741, 0.29731, 0.3057, 0.29804, 0.28585], "rmse": [0.33053, 0.33746, 0.3396, 0.34342, 0.35095, 0.3395, 0.33162], "corr": [0.33679, -0.57513, -0.3823, -0.4058, -0.30789, -0.19307, -0.52464], "std_ratio": [0.10556, 0.14112, 0.12679, 0.27509, 0.23722, 0.12083, 0.12455], "w_frac": []}, "FFT-peak": {"norm": [13.1568, 13.14423, 13.37907, 13.52312, 13.18826, 12.82921, 13.44745], "mae": [1.48285, 1.48144, 1.50791, 1.52414, 1.4864, 1.44593, 1.51561], "rmse": [1.84411, 1.83823, 1.86964, 1.88472, 1.84795, 1.80127, 1.87746], "corr": [-0.03904, -0.04041, -0.05289, -0.10744, -0.00942, -0.00095, -0.08774], "std_ratio": [5.92342, 5.99951, 6.18494, 6.4141, 5.98163, 6.03017, 5.98719], "w_frac": []}, "_ns": [0.11271, 0.11271, 0.11271, 0.11271, 0.11271, 0.11271, 0.11271]}, "thermal": {"KF": {"norm": [1.02364, 1.03439, 1.06083, 1.03538, 1.04097, 1.04144, 1.04681], "mae": [0.05976, 0.06039, 0.06193, 0.06044, 0.06077, 0.0608, 0.06111], "rmse": [0.07595, 0.0767, 0.07868, 0.0763, 0.07644, 0.07733, 0.07798], "corr": [0.04986, 0.05634, 0.01436, 0.05898, 0.02521, 0.0173, 0.00924], "std_ratio": [0.36335, 0.38827, 0.39177, 0.38336, 0.37968, 0.36789, 0.37296], "w_frac": []}, "Huber KF": {"norm": [1.02364, 1.03439, 1.06083, 1.03538, 1.04097, 1.04144, 1.04681], "mae": [0.05976, 0.06039, 0.06193, 0.06044, 0.06077, 0.0608, 0.06111], "rmse": [0.07595, 0.0767, 0.07868, 0.0763, 0.07644, 0.07733, 0.07798], "corr": [0.04986, 0.05634, 0.01436, 0.05898, 0.02521, 0.0173, 0.00924], "std_ratio": [0.36335, 0.38827, 0.39177, 0.38336, 0.37968, 0.36789, 0.37296], "w_frac": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}, "EKF": {"norm": [0.29339, 0.28641, 0.29069, 0.28047, 0.27883, 0.26402, 0.26733], "mae": [0.01713, 0.01672, 0.01697, 0.01637, 0.01628, 0.01541, 0.01561], "rmse": [0.02169, 0.02117, 0.02127, 0.02081, 0.0206, 0.01952, 0.01993], "corr": [0.9901, 0.99144, 0.99115, 0.99331, 0.99132, 0.99069, 0.99124], "std_ratio": [1.01443, 0.99592, 1.0079, 1.01256, 1.01977, 1.02757, 1.01422], "w_frac": []}, "UKF": {"norm": [0.29344, 0.28638, 0.29085, 0.28051, 0.27883, 0.26406, 0.26737], "mae": [0.01713, 0.01672, 0.01698, 0.01638, 0.01628, 0.01542, 0.01561], "rmse": [0.02169, 0.02116, 0.02128, 0.02082, 0.0206, 0.01952, 0.01993], "corr": [0.9901, 0.99144, 0.99115, 0.99332, 0.99132, 0.99069, 0.99124], "std_ratio": [1.01445, 0.99596, 1.00794, 1.01258, 1.0198, 1.0276, 1.01423], "w_frac": []}, "KF-biexp": {"norm": [0.35418, 0.34684, 0.35698, 0.33871, 0.33891, 0.32841, 0.32141], "mae": [0.02068, 0.02025, 0.02084, 0.01977, 0.01978, 0.01917, 0.01876], "rmse": [0.02575, 0.02519, 0.02566, 0.02466, 0.02476, 0.02378, 0.02356], "corr": [0.97703, 0.97927, 0.97813, 0.98218, 0.97875, 0.97644, 0.97883], "std_ratio": [1.01202, 0.99029, 1.00979, 1.01712, 1.01699, 1.0272, 1.00082], "w_frac": []}, "KF-reg": {"norm": [0.35539, 0.3484, 0.3583, 0.33988, 0.33973, 0.32873, 0.32233], "mae": [0.02075, 0.02034, 0.02092, 0.01984, 0.01983, 0.01919, 0.01882], "rmse": [0.02582, 0.0253, 0.02577, 0.02474, 0.02483, 0.0238, 0.02363], "corr": [0.97689, 0.97916, 0.97827, 0.98226, 0.9787, 0.97651, 0.97894], "std_ratio": [1.01187, 0.9904, 1.01028, 1.01715, 1.01715, 1.02757, 1.00123], "w_frac": []}, "SGD (author)": {"norm": [0.36889, 0.34557, 0.34877, 0.33242, 0.34086, 0.33724, 0.33333], "mae": [0.02154, 0.02017, 0.02036, 0.01941, 0.0199, 0.01969, 0.01946], "rmse": [0.02645, 0.02494, 0.02484, 0.02414, 0.0247, 0.02419, 0.02408], "corr": [0.96631, 0.96972, 0.96974, 0.97373, 0.97127, 0.96717, 0.9675], "std_ratio": [1.00642, 0.98723, 1.00602, 1.00394, 1.00401, 1.01846, 0.99867], "w_frac": []}, "SGD-biexp": {"norm": [0.36068, 0.34698, 0.35483, 0.33693, 0.34108, 0.33631, 0.32879], "mae": [0.02106, 0.02026, 0.02071, 0.01967, 0.01991, 0.01963, 0.01919], "rmse": [0.02601, 0.02508, 0.02524, 0.02439, 0.02477, 0.02415, 0.02378], "corr": [0.96971, 0.97211, 0.97117, 0.97588, 0.97226, 0.96868, 0.97094], "std_ratio": [1.00749, 0.98728, 1.00606, 1.01045, 1.01104, 1.02244, 0.99869], "w_frac": []}, "RLS": {"norm": [0.3735, 0.36761, 0.37808, 0.36109, 0.35464, 0.33978, 0.33415], "mae": [0.0218, 0.02146, 0.02207, 0.02108, 0.0207, 0.01984, 0.01951], "rmse": [0.02739, 0.02687, 0.02746, 0.02649, 0.02612, 0.02483, 0.02485], "corr": [0.98384, 0.98762, 0.98619, 0.98919, 0.98736, 0.98553, 0.98765], "std_ratio": [1.0174, 0.99434, 1.01373, 1.02187, 1.01948, 1.03188, 1.00401], "w_frac": []}, "alpha-beta": {"norm": [1.20837, 1.26518, 1.27856, 1.24603, 1.22612, 1.23108, 1.2609], "mae": [0.07054, 0.07386, 0.07464, 0.07274, 0.07158, 0.07187, 0.07361], "rmse": [0.08931, 0.09226, 0.09414, 0.09107, 0.09059, 0.09115, 0.09288], "corr": [0.46872, 0.47395, 0.41976, 0.47395, 0.42793, 0.42179, 0.40396], "std_ratio": [0.59564, 0.60549, 0.6324, 0.627, 0.61211, 0.60393, 0.61057], "w_frac": []}, "Complementary": {"norm": [0.35131, 0.35458, 0.36242, 0.33998, 0.34486, 0.32871, 0.32784], "mae": [0.02051, 0.0207, 0.02116, 0.01985, 0.02013, 0.01919, 0.01914], "rmse": [0.02551, 0.02564, 0.02593, 0.02468, 0.02495, 0.02369, 0.02385], "corr": [0.97292, 0.97487, 0.97454, 0.97962, 0.97356, 0.97326, 0.97428], "std_ratio": [1.00877, 0.99176, 1.00973, 1.01183, 1.01478, 1.0235, 1.00476], "w_frac": []}, "PLL": {"norm": [1.20837, 1.26518, 1.27856, 1.24603, 1.22612, 1.23108, 1.2609], "mae": [0.07054, 0.07386, 0.07464, 0.07274, 0.07158, 0.07187, 0.07361], "rmse": [0.08931, 0.09226, 0.09414, 0.09107, 0.0906, 0.09115, 0.09288], "corr": [0.46864, 0.47386, 0.41968, 0.47386, 0.42785, 0.4217, 0.40388], "std_ratio": [0.59567, 0.60552, 0.63242, 0.62702, 0.61213, 0.60396, 0.61059], "w_frac": []}, "LP readout": {"norm": [1.20963, 1.26591, 1.28102, 1.24738, 1.22822, 1.23083, 1.26274], "mae": [0.07062, 0.0739, 0.07478, 0.07282, 0.0717, 0.07185, 0.07372], "rmse": [0.08916, 0.09208, 0.09394, 0.09088, 0.09043, 0.09098, 0.09273], "corr": [0.4861, 0.4919, 0.43725, 0.49155, 0.445, 0.43901, 0.4212], "std_ratio": [0.58535, 0.59494, 0.62193, 0.61658, 0.60243, 0.59397, 0.60041], "w_frac": []}, "Zero-crossing": {"norm": [5.23747, 5.69366, 5.5025, 5.7006, 5.26513, 5.14152, 5.48184], "mae": [0.30575, 0.33238, 0.32123, 0.33279, 0.30737, 0.30015, 0.32002], "rmse": [0.32434, 0.35073, 0.33943, 0.35165, 0.32616, 0.32326, 0.34107], "corr": [-0.27783, -0.02634, -0.46666, -0.09694, -0.50002, -0.74397, -0.51252], "std_ratio": [0.34735, 0.37335, 0.45607, 0.5255, 0.27392, 0.49626, 0.42102], "w_frac": []}, "FFT-peak": {"norm": [23.68037, 23.47634, 23.35415, 23.30707, 23.45761, 23.71753, 23.50308], "mae": [1.38242, 1.3705, 1.36337, 1.36062, 1.36941, 1.38458, 1.37207], "rmse": [1.73289, 1.72191, 1.71012, 1.71339, 1.72246, 1.73446, 1.72185], "corr": [0.12867, 0.15129, 0.18161, 0.17868, 0.13361, 0.11611, 0.13816], "std_ratio": [13.45614, 13.68691, 13.42005, 13.37507, 13.87278, 13.78108, 13.74508], "w_frac": []}, "_ns": [0.05838, 0.05838, 0.05838, 0.05838, 0.05838, 0.05838, 0.05838]}}}, "tuned": {"mild": {"KF": {"params": {"q_om": 0.001, "q_psi": 0.01}, "edge": ["q_om"], "evals": 42, "obj": 0.4858534438236849, "rounds": 4}, "Huber KF": {"params": {"huber": 1.345, "q_psi": 0.01, "q_om": 0.001}, "edge": [], "evals": 10, "obj": 0.4858354155884249, "rounds": 1}, "EKF": {"params": {"q_L": 0.0001, "q_psi": 0.0001, "q_om": 0.0001}, "edge": [], "evals": 4, "obj": 0.2404349630381966, "rounds": 1}, "UKF": {"params": {"q_L": 0.0001, "q_psi": 0.0001, "q_om": 0.0001}, "edge": [], "evals": 4, "obj": 0.2404349630381966, "rounds": 1, "note": "reuses EKF noise settings (same model)"}, "KF-reg": {"params": {"q": 0.1, "r_mult": 10}, "edge": ["q", "r_mult"], "evals": 40, "obj": 0.31123525730768864, "rounds": 4}, "KF-biexp": {"params": {"q": 0.01, "r_mult": 0.3}, "edge": ["q"], "evals": 48, "obj": 0.29543049598630833, "rounds": 4}, "SGD (author)": {"params": {"k_i": 0.003, "lr": 0.003}, "edge": [], "evals": 20, "obj": 0.33389954734075533, "rounds": 1}, "SGD-biexp": {"params": {"k_i": 0.003, "lr": 0.001}, "edge": [], "evals": 20, "obj": 0.3342831137044763, "rounds": 1}, "RLS": {"params": {"lam": 0.995}, "edge": [], "evals": 4, "obj": 0.29175338401413103, "rounds": 1}, "alpha-beta": {"params": {"alpha": 0.05, "ratio": 0.1}, "edge": [], "evals": 20, "obj": 0.49360301449116445, "rounds": 1}, "Complementary": {"params": {"alpha": 0.003}, "edge": [], "evals": 4, "obj": 0.36361597949288943, "rounds": 1}, "PLL": {"params": {"alpha": 0.05, "ratio": 0.1}, "edge": [], "evals": 20, "obj": 0.4936068825308167, "rounds": 1}, "LP readout": {"params": {"alpha": 0.003}, "edge": [], "evals": 5, "obj": 0.4889638481264284, "rounds": 2}, "Zero-crossing": {"params": {"window": 3200}, "edge": ["window"], "evals": 7, "obj": 3.4603081629533694, "rounds": 4}, "FFT-peak": {"params": {"hop": 5, "window": 50}, "edge": [], "evals": 21, "obj": 21.99780046510917, "rounds": 3}}, "harsh": {"KF": {"params": {"q_om": 1.0000000000000002e-12, "q_psi": 0.01}, "edge": ["q_om"], "evals": 35, "obj": 1.2564574545009086, "rounds": 4}, "Huber KF": {"params": {"huber": 8.0, "q_psi": 0.01, "q_om": 1.0000000000000002e-12}, "edge": [], "evals": 10, "obj": 1.2564574545009086, "rounds": 1}, "EKF": {"params": {"q_L": 0.1, "q_psi": 0.0001, "q_om": 0.0001}, "edge": [], "evals": 7, "obj": 0.32184465625786873, "rounds": 4}, "UKF": {"params": {"q_L": 0.1, "q_psi": 0.0001, "q_om": 0.0001}, "edge": [], "evals": 7, "obj": 0.32184465625786873, "rounds": 4, "note": "reuses EKF noise settings (same model)"}, "KF-reg": {"params": {"q": 0.1, "r_mult": 10}, "edge": ["q", "r_mult"], "evals": 40, "obj": 0.41060830661833636, "rounds": 4}, "KF-biexp": {"params": {"q": 0.0001, "r_mult": 0.01}, "edge": [], "evals": 42, "obj": 0.40985761411481214, "rounds": 3}, "SGD (author)": {"params": {"k_i": 0.003, "lr": 0.1}, "edge": [], "evals": 30, "obj": 0.42291208385449125, "rounds": 3}, "SGD-biexp": {"params": {"k_i": 0.003, "lr": 0.01}, "edge": [], "evals": 25, "obj": 0.4251284930276334, "rounds": 2}, "RLS": {"params": {"lam": 0.995}, "edge": [], "evals": 4, "obj": 0.39978192967938886, "rounds": 1}, "alpha-beta": {"params": {"alpha": 0.02, "ratio": 0.03}, "edge": [], "evals": 25, "obj": 1.665766238742374, "rounds": 2}, "Complementary": {"params": {"alpha": 0.003}, "edge": [], "evals": 4, "obj": 0.8666704408016566, "rounds": 1}, "PLL": {"params": {"alpha": 0.02, "ratio": 0.03}, "edge": [], "evals": 25, "obj": 1.6657706323909396, "rounds": 2}, "LP readout": {"params": {"alpha": 0.0003}, "edge": [], "evals": 4, "obj": 1.6651434939797731, "rounds": 1}, "Zero-crossing": {"params": {"window": 3200}, "edge": ["window"], "evals": 7, "obj": 5.191358426528059, "rounds": 4}, "FFT-peak": {"params": {"hop": 5, "window": 50}, "edge": [], "evals": 21, "obj": 19.472843926635594, "rounds": 3}}}, "sweeps": {"glitch": {"levels": [0.0, 0.001, 0.005, 0.01, 0.02], "res": {"KF": [0.61089, 0.61587, 0.63764, 0.66445, 0.71673], "Huber KF": [0.61091, 0.61047, 0.61053, 0.61058, 0.61072], "EKF": [0.24376, 0.24829, 0.27078, 0.29814, 0.35135], "UKF": [0.24376, 0.24829, 0.27079, 0.29814, 0.35135], "KF-biexp": [0.29408, 1.66774, 5.82976, 10.11144, 16.48733], "KF-reg": [0.26567, 1.4643, 4.8528, 8.24288, 13.07836], "SGD (author)": [0.27864, 1.34427, 4.41709, 7.57153, 11.95229], "SGD-biexp": [0.28022, 1.36692, 4.44935, 7.59614, 12.01147], "RLS": [0.27235, 1.60197, 5.52547, 9.48263, 15.26732], "alpha-beta": [0.5842, 0.58452, 0.58807, 0.59168, 0.60002], "Complementary": [0.37705, 1.32211, 4.16581, 7.293, 11.73436], "PLL": [0.5842, 0.5838, 0.58448, 0.58505, 0.58644], "LP readout": [0.60564, 1.52057, 4.29271, 7.37157, 11.77692], "Zero-crossing": [4.15286, 2.5081, 14.49695, 32.71016, 69.3092], "FFT-peak": [26.10667, 26.1092, 26.18324, 26.22431, 26.31034]}, "corr": {"KF": [0.96199, 0.96165, 0.95972, 0.95727, 0.95227], "Huber KF": [0.96199, 0.96213, 0.96213, 0.96212, 0.96211], "EKF": [0.99475, 0.99477, 0.99431, 0.99343, 0.99164], "UKF": [0.99475, 0.99477, 0.99431, 0.99343, 0.99164], "KF-biexp": [0.99169, 0.60338, 0.19306, 0.14386, 0.04204], "KF-reg": [0.98097, 0.70519, 0.26591, 0.2058, 0.06804], "SGD (author)": [0.97499, 0.73352, 0.28936, 0.22366, 0.06791], "SGD-biexp": [0.9747, 0.7301, 0.30018, 0.23657, 0.08799], "RLS": [0.98894, 0.64699, 0.22025, 0.16765, 0.04955], "alpha-beta": [0.95275, 0.9529, 0.9528, 0.9527, 0.95221], "Complementary": [0.96987, 0.74245, 0.31286, 0.25257, 0.09899], "PLL": [0.95275, 0.95292, 0.9529, 0.9529, 0.95282], "LP readout": [0.96017, 0.74506, 0.31966, 0.25857, 0.10403], "Zero-crossing": [-0.33008, -0.06912, -0.00367, 0.01272, 0.04568], "FFT-peak": [0.03804, 0.03724, 0.03605, 0.03658, 0.03494]}, "huber_wfrac": [0.13451, 0.13554, 0.13959, 0.14479, 0.15554], "ns": [0.05838, 0.05838, 0.05838, 0.05838, 0.05838]}, "dither": {"levels": [50, 100, 200, 500, 1000], "res": {"KF": [3.05106, 1.28289, 0.61089, 0.32051, 0.26516], "Huber KF": [3.05184, 1.28311, 0.61091, 0.32033, 0.26492], "EKF": [0.47558, 0.31394, 0.24376, 0.21685, 0.2125], "UKF": [0.47784, 0.31392, 0.24376, 0.21685, 0.2125], "KF-biexp": [0.49942, 0.34956, 0.29408, 0.2767, 0.27338], "KF-reg": [0.46184, 0.3107, 0.26567, 0.25261, 0.25031], "SGD (author)": [0.47618, 0.32318, 0.27864, 0.26733, 0.26544], "SGD-biexp": [0.51245, 0.33504, 0.28022, 0.26705, 0.26527], "RLS": [0.4768, 0.32689, 0.27235, 0.25557, 0.25236], "alpha-beta": [2.97736, 1.21748, 0.5842, 0.33613, 0.29514], "Complementary": [1.52814, 0.67462, 0.37705, 0.28064, 0.26626], "PLL": [2.9774, 1.2175, 0.5842, 0.33613, 0.29514], "LP readout": [3.03042, 1.26488, 0.60564, 0.32981, 0.27898], "Zero-crossing": [6.42555, 4.69564, 4.15286, 3.72795, 3.72294], "FFT-peak": [21.66208, 24.85642, 26.10667, 26.43816, 26.44286]}, "corr": {"KF": [0.60647, 0.91296, 0.96199, 0.97561, 0.97726], "Huber KF": [0.60652, 0.91296, 0.96199, 0.97561, 0.97726], "EKF": [0.98713, 0.99323, 0.99475, 0.99519, 0.99525], "UKF": [0.98712, 0.99323, 0.99475, 0.99519, 0.99525], "KF-biexp": [0.98382, 0.99012, 0.99169, 0.99193, 0.992], "KF-reg": [0.97374, 0.97999, 0.98097, 0.98103, 0.98107], "SGD (author)": [0.96612, 0.97414, 0.97499, 0.97506, 0.97512], "SGD-biexp": [0.95284, 0.97233, 0.9747, 0.97501, 0.97504], "RLS": [0.98153, 0.98751, 0.98894, 0.98912, 0.98918], "alpha-beta": [0.59916, 0.90615, 0.95275, 0.96549, 0.96698], "Complementary": [0.75619, 0.94803, 0.96987, 0.97485, 0.97537], "PLL": [0.59916, 0.90615, 0.95275, 0.96549, 0.96698], "LP readout": [0.60497, 0.91177, 0.96017, 0.9735, 0.97509], "Zero-crossing": [-0.52724, -0.21057, -0.33008, 0.26658, -0.04548], "FFT-peak": [0.03532, 0.12499, 0.03804, 0.01856, 0.01024]}, "huber_wfrac": [0.32, 0.17323, 0.13451, 0.12382, 0.12221], "ns": [0.05838, 0.05838, 0.05838, 0.05838, 0.05838]}}, "costs": {"KF": {"us_per_step": 11.380861049997293, "lag_samples": 170, "nominal_latency": null, "corr": 0.8239359117540515, "ratio": 1.0}, "Huber KF": {"us_per_step": 16.224029199997858, "lag_samples": 170, "nominal_latency": null, "corr": 0.8237554391895534, "ratio": 1.4255537545642663}, "EKF": {"us_per_step": 51.481290599997465, "lag_samples": 90, "nominal_latency": null, "corr": 0.9092701313740723, "ratio": 4.523496980925684}, "UKF": {"us_per_step": 86.02784249999331, "lag_samples": 90, "nominal_latency": null, "corr": 0.9092693702575494, "ratio": 7.558992427907182}, "KF-biexp": {"us_per_step": 21.6593998999997, "lag_samples": 100, "nominal_latency": null, "corr": 0.9004288773662522, "ratio": 1.9031424603857061}, "KF-reg": {"us_per_step": 7.8711621500019655, "lag_samples": 160, "nominal_latency": null, "corr": 0.8385522066648864, "ratio": 0.6916139398788141}, "SGD (author)": {"us_per_step": 4.889631200001077, "lag_samples": 180, "nominal_latency": null, "corr": 0.8183231649970623, "ratio": 0.4296363147322882}, "SGD-biexp": {"us_per_step": 6.961303799994312, "lag_samples": 180, "nominal_latency": null, "corr": 0.8183186301974774, "ratio": 0.6116675855554855}, "RLS": {"us_per_step": 9.876638749994981, "lag_samples": 120, "nominal_latency": null, "corr": 0.8777111767424148, "ratio": 0.8678287790884971}, "alpha-beta": {"us_per_step": 5.114347100004579, "lag_samples": 210, "nominal_latency": null, "corr": 0.7833702736736085, "ratio": 0.4493813849002045}, "Complementary": {"us_per_step": 2.313330499998756, "lag_samples": 180, "nominal_latency": null, "corr": 0.8187559929658053, "ratio": 0.20326498055253087}, "PLL": {"us_per_step": 5.587306600000375, "lag_samples": 210, "nominal_latency": null, "corr": 0.7833603878495861, "ratio": 0.49093882927265015}, "LP readout": {"us_per_step": 1.610548949997792, "lag_samples": 180, "nominal_latency": null, "corr": 0.8190795568301791, "ratio": 0.14151380488018306}, "Zero-crossing": {"us_per_step": 1.0100347500042517, "lag_samples": null, "nominal_latency": 1600, "corr": -0.10968229728243034, "ratio": 0.08874853541986544}, "FFT-peak": {"us_per_step": 6.964244949995191, "lag_samples": null, "nominal_latency": 25, "corr": 0.017665673531824473, "ratio": 0.6119260150352901}}}''')
 
 
-# ============================================================
-# Main
-# ============================================================
-if __name__ == "__main__":
-    t_start = time.time()
+# ======================= BENCHMARK DRIVER =======================
+class _NS:                      # exposes this file's globals as attributes (works as script, import, or notebook cell)
+    def __getattr__(self, k): return globals()[k]
+A = _NS()
+#!/usr/bin/env python3
+"""RLG estimator benchmark v15 -- unified framework, Track A (lock-in rate estimation).
+Usage: python rlg_bench.py {selftest|tune|eval|sweeps|costs|report|all} [mild|harsh]
+Env:   RLG_SMOKE=1 (tiny budget, for testing the pipeline)   RLG_OUT=<dir> (results directory)"""
+import sys, os, json, time
+import numpy as np
+from scipy.stats import t as student_t, ttest_rel, spearmanr
 
-    print("=" * 78)
-    print("Extended benchmark v2: full error budget + 10 estimators + 1D sweeps")
-    print("=" * 78)
-    print(f"  Train seeds: {TRAIN_SEEDS}")
-    print(f"  Test seeds : {TEST_SEEDS}")
-    print(f"  Estimators : {len(ESTIMATORS)}  ({', '.join(ESTIMATORS)})")
-    print(f"  Runtime estimate: ~20 min")
-    print("=" * 78)
+OUT = A.OUT; REGS = A.REGS; FAM = {e: REGISTRY[e][1] for e in ORDER}
+LABEL = {k: v['label'] for k, v in A.CFG['lockin'].items()}
 
-    # Step 1: tune
-    print(f"\n{'='*78}\nStep 1: Tuning all 10 estimators on '{SCENARIO_REALISTIC}'\n{'='*78}")
-    t0 = time.time()
-    tuned = tune_all(make_realistic)
-    print(f"  Tuning wall clock: {time.time()-t0:.1f}s")
+def log(s): print(s, flush=True)
+def ci(a):
+    a = np.asarray(a, float); n = len(a)
+    if n < 2: return float(a.mean()), float('nan'), float('nan')
+    mu = a.mean(); se = a.std(ddof=1) / np.sqrt(n); tc = student_t.ppf(.975, n - 1); return float(mu), float(mu - tc * se), float(mu + tc * se)
+def load(name):
+    p = f"{OUT}/{name}"; return json.load(open(p)) if os.path.exists(p) else None
 
-    # Step 2: baseline table
-    print(f"\n{'='*78}\nStep 2: Baseline table on '{SCENARIO_REALISTIC}'\n{'='*78}")
-    base_errs = {est: [] for est in ESTIMATORS}
-    for ts in TEST_SEEDS:
-        S, Y, om, _, dt = make_realistic(seed=ts)
-        for est in ESTIMATORS:
-            e = run_by_name(est, tuned[est], S, Y, dt)
-            base_errs[est].append(score(e, om, TE, dt))
+# ------------------------------------------------------------------ analysis
+def stat(ev, reg, e):
+    d = ev[reg][e]; m, lo, hi = ci(d['norm'])
+    return dict(mean=m, lo=lo, hi=hi, corr=float(np.mean(d['corr'])), sr=float(np.mean(d['std_ratio'])),
+                collapsed=bool(np.mean(d['std_ratio']) < 0.1), nontrack=bool(np.mean(d['corr']) < 0.3))
+def flag(s): return ' ⛔collapsed' if s['collapsed'] else (' ⚠non-tracking' if s['nontrack'] else '')
+def valid(ev, reg): return [e for e in ORDER if not stat(ev, reg, e)['collapsed']]
+def winner(ev, reg):
+    v = valid(ev, reg); w = min(v, key=lambda e: stat(ev, reg, e)['mean'])
+    wn = np.array(ev[reg][w]['norm']); wm = wn.mean(); tied = []
+    for e in v:
+        if e == w: continue
+        d = np.array(ev[reg][e]['norm']) - wn; m, lo, hi = ci(d)
+        if (lo < 0 < hi) or (m / wm < 0.05): tied.append(e)
+    return w, tied
+def frontier(pts):  # pts: [(cost, err, name)]
+    best = np.inf; out = []
+    for c, e, n in sorted(pts):
+        if e < best: out.append(n); best = e
+    return out
 
-    print(f"  {'Estimator':<15}{'Mean err':>10}{'95% CI':>28}")
-    print("  " + "-" * 55)
-    for est in ESTIMATORS:
-        errs = np.concatenate(base_errs[est])
-        print(f"  {est:<15}{errs.mean():>10.4f}{ci_95(errs):>28}")
+# -------------------------------------------------------------------- tables
+def table_main(lockin, ev):
+    ns = len(ev[REGS[0]]['KF']['norm'])
+    L = [f"### Table 1 — {LABEL[lockin]}: normalised error = MAE / MAE(no-skill mean predictor)  (1.0 = no skill) [95% CI over {ns} test seeds] · r = corr(Ω̂, Ω)\n",
+         "| estimator | family | " + " | ".join(REGS) + " |", "|---|---|" + "---|" * len(REGS)]
+    for e in ORDER:
+        cells = []
+        for r in REGS:
+            s = stat(ev, r, e); cells.append(f"{s['mean']:.3f} [{s['lo']:.3f}, {s['hi']:.3f}] r={s['corr']:.2f}{flag(s)}")
+        L.append(f"| {e} | {FAM[e]} | " + " | ".join(cells) + " |")
+    L.append("| *no-skill MAE (rad/s)* | – | " + " | ".join(f"{np.mean(ev[r]['_ns']):.4f}" for r in REGS) + " |\n")
+    for r in REGS:
+        w, tied = winner(ev, r); ws = stat(ev, r, w)
+        L.append(f"- **{r}**: best non-collapsed estimator = **{w}** ({ws['mean']:.3f}); within 5% or statistically tied: {', '.join(tied) if tied else 'none'}.")
+    L.append("\n*⛔collapsed = std(Ω̂) < 0.1·std(Ω) (near-constant output; excluded from ranking). ⚠non-tracking = corr < 0.3 (ranked, but not following Ω).*\n")
+    L += [f"### Table 1b — {LABEL[lockin]}: paired difference vs EKF (normalised error; positive = worse than EKF). Cell: mean diff [95% CI over {ns} seeds]; p7 = paired t-test over seeds (conservative, primary); p112 = over all {ns}x16 unit pairs (units share Ω, ΩL events and seed, so p112 overstates independence)\n",
+          "| estimator | " + " | ".join(REGS) + " |", "|---|" + "---|" * len(REGS)]
+    for e in ORDER:
+        if e == 'EKF': continue
+        cells = []
+        for r in REGS:
+            d = np.array(ev[r][e]['norm']) - np.array(ev[r]['EKF']['norm']); m, lo, hi = ci(d)
+            p7 = ttest_rel(ev[r][e]['norm'], ev[r]['EKF']['norm']).pvalue
+            if ev[r][e].get('unit_norm'):
+                ua = np.array(ev[r][e]['unit_norm']).ravel(); ub = np.array(ev[r]['EKF']['unit_norm']).ravel(); p112 = f"{ttest_rel(ua, ub).pvalue:.2g}"
+            else: p112 = 'n/a (embedded reference)'
+            cells.append(f"{m:+.3f} [{lo:+.3f}, {hi:+.3f}] p7={p7:.2g}, p112={p112}")
+        L.append(f"| {e} | " + " | ".join(cells) + " |")
+    return L + [""]
 
-    # Step 3: 1D sweeps
-    # --- Sweep A: ARW level ---
-    def make_arw(arw_val, seed=11):
-        return make_data('piecewise', seed=seed,
-                         arw=arw_val, bias_inst=0.003, bias_inst_tau=100.0,
-                         rrw=0.0003, sf_nonlin=0.02,
-                         temp_amp=1.0, temp_period=80.0,
-                         temp_oml_gain=0.1, temp_bias_gain=0.005)
+def table_abs(lockin, ev):
+    L = [f"### Table 2 ({LABEL[lockin]}) — raw error in simulation units (rad/s): MAE and RMSE, mean over test seeds\n", "| estimator | " + " | ".join(f"{r} MAE / RMSE" for r in REGS) + " |", "|---|" + "---|" * len(REGS)]
+    for e in ORDER: L.append(f"| {e} | " + " | ".join(f"{np.mean(ev[r][e]['mae']):.4f} / {np.mean(ev[r][e]['rmse']):.4f}" for r in REGS) + " |")
+    return L + [""]
 
-    arw_values = [0.01, 0.03, 0.05, 0.1, 0.2]
-    sweep_a = sweep_1d('ARW sweep', make_arw, arw_values, tuned)
+SHI_RATIO = 1.182 / 1.057    # UKF/EKF RMSE ratio as reported (cited, NOT independently verified)
+def table_anchor(evs):
+    L = ["### Table 9 — Real-data anchor (ratio check only)\n",
+         "Shi et al. 2026 are cited (as supplied, not verified here) as reporting EKF RMSE 1.057 mHz and UKF RMSE 1.182 mHz on a 150,802-sample square He–Ne record: UKF/EKF = %.3f. " % SHI_RATIO +
+         "This benchmark runs in normalised units (rad/s) on a different sensor model, so absolute RMSE is NOT comparable with mHz; only the UKF/EKF ratio is shown. No real record was available here, so this is NOT a validation.\n",
+         "| config | regime | EKF RMSE | UKF RMSE | UKF/EKF | cited ratio |", "|---|---|---|---|---|---|"]
+    for lk, ev in evs.items():
+        for r in REGS:
+            a = np.mean(ev[r]['EKF']['rmse']); b = np.mean(ev[r]['UKF']['rmse']); L.append(f"| {lk} | {r} | {a:.4f} | {b:.4f} | {b/a:.3f} | {SHI_RATIO:.3f} |")
+    return L + [""]
 
-    # --- Sweep B: contamination fraction ---
-    def make_contam(pct, seed=11):
-        rng = np.random.default_rng(seed)
-        nt = int(200.0 / 0.01)
-        R_ = 16; DT_ = 0.01
-        omega_fn = lambda t: 0.3 + 0.1 * np.sin(2 * np.pi * t / 100)
-        psi = rng.uniform(-np.pi, np.pi, R_)
-        S_ = np.zeros((nt, R_)); Y_ = np.zeros((nt, R_))
-        if pct > 0:
-            cmask = rng.random((nt, R_)) < pct
-            cmag = rng.choice([-5.0, 5.0], size=(nt, R_))
-        else:
-            cmask = np.zeros((nt, R_), dtype=bool)
-            cmag = np.zeros((nt, R_))
-        rho = np.exp(-DT_ / 100.0)
-        sigma_ou = 0.003 * np.sqrt(1 - rho**2)
-        bias = np.zeros((nt, R_)); rrw = np.zeros((nt, R_))
-        for k in range(nt):
-            t = k * DT_
-            probe = np.sin(2 * np.pi * t / 5)
-            oml = 1.0 if t < 60 else 2.0
-            if k > 0:
-                bias[k] = rho * bias[k-1] + sigma_ou * rng.standard_normal(R_)
-                rrw[k]  = rrw[k-1] + 0.0003 * np.sqrt(DT_) * rng.standard_normal(R_)
-            dT = 1.0 * np.sin(2 * np.pi * t / 80.0)
-            oml_eff = oml * (1 + 0.1 * dT)
-            bias_eff = bias[k] + 0.005 * dT
-            s = np.sin(psi)
-            raw    = omega_fn(t) + bias_eff + rrw[k] + probe - oml_eff * s
-            signal = omega_fn(t) + bias_eff + rrw[k] - oml_eff * s
-            y_m = signal * (1 + 0.02 * signal)
-            noise = 0.03 * np.sqrt(DT_) * rng.standard_normal(R_)
-            noise = noise + cmask[k] * cmag[k] * 0.03 * np.sqrt(DT_)
-            dpsi = raw * DT_ + noise
-            S_[k] = s; Y_[k] = y_m; psi = psi + dpsi
-        return S_, Y_, omega_fn, None, DT_
+def table_collapse(lockin, ev):
+    L = [f"### Table 5 — {LABEL[lockin]}: collapse diagnostic, std(Ω̂)/std(Ω) · corr · verdict\n", "| estimator | " + " | ".join(REGS) + " |", "|---|" + "---|" * len(REGS)]
+    for e in ORDER:
+        cells = []
+        for r in REGS:
+            s = stat(ev, r, e); v = 'COLLAPSED' if s['collapsed'] else ('non-tracking' if s['nontrack'] else 'tracks')
+            cells.append(f"{s['sr']:.2f} · {s['corr']:+.2f} · {v}")
+        L.append(f"| {e} | " + " | ".join(cells) + " |")
+    return L + [""]
 
-    contam_values = [0.0, 0.01, 0.02, 0.05, 0.10, 0.20]
-    sweep_b = sweep_1d('Contamination sweep', make_contam, contam_values, tuned)
+def table_huber(lockin, ev, tuned, sw=None):
+    thr = tuned['Huber KF']['params']['huber']; L = [f"### Table 4 ({LABEL[lockin]}) — Huber threshold selection\n", "| regime | tuned threshold | % of updates with w<1 | verdict |", "|---|---|---|---|"]
+    for r in REGS:
+        wf = 100 * np.mean(ev[r]['Huber KF']['w_frac'])
+        v = "Huber ≡ KF in this regime; robust weighting did not engage" if wf < 1 else "robust weighting engaged"
+        L.append(f"| {r} | {thr:g}{' (grid-limited)' if tuned['Huber KF']['edge'] else ''} | {wf:.2f}% | {v} |")
+    if sw: L.append("\nUnder glitches (mild static, tuned threshold held fixed): % updates with w<1 at glitch levels " + ", ".join(f"{g:g}→{100*w:.2f}%" for g, w in zip(sw['glitch']['levels'], sw['glitch']['huber_wfrac'])) + ".")
+    return L + [""]
 
-    # --- Sweep C: temperature amplitude ---
-    def make_temp(temp_amp, seed=11):
-        return make_data('piecewise', seed=seed,
-                         arw=0.03, bias_inst=0.003, bias_inst_tau=100.0,
-                         rrw=0.0003, sf_nonlin=0.02,
-                         temp_amp=temp_amp, temp_period=80.0,
-                         temp_oml_gain=0.1, temp_bias_gain=0.005)
+def table_tuning(lockin, tuned):
+    L = [f"### Table 8 ({LABEL[lockin]}) — tuning summary (train seeds only, pooled over regimes; objective = mean normalised error)\n", "| estimator | tuned parameters | evals | grid-limited? |", "|---|---|---|---|"]
+    for e in ORDER:
+        t = tuned[e]; ps = ", ".join(f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}" for k, v in t['params'].items())
+        L.append(f"| {e} | {ps} | {t['evals']} | {('YES: ' + ', '.join(t['edge']) + ' — no interior optimum found') if t['edge'] else 'no'}{' (reuses EKF)' if e == 'UKF' else ''} |")
+    return L + [""]
 
-    temp_values = [0.0, 0.5, 1.0, 2.0, 5.0]
-    sweep_c = sweep_1d('Temperature sweep', make_temp, temp_values, tuned)
+def table_cost(costs, evs):
+    L = [f"### Table 3 — Cost & latency (mild lock-in, tuned parameters; {A.R_UNITS} units vectorised, numpy)\n", "| estimator | µs/step | cost ratio vs KF | measured lag (samples) | nominal latency (samples) | flagged |", "|---|---|---|---|---|---|"]
+    for e in ORDER:
+        c = costs[e]; fl = []
+        for lk, ev in evs.items():
+            for r in REGS:
+                s = stat(ev, r, e)
+                if s['collapsed']: fl.append(f"{lk}/{r}: collapsed")
+                elif s['nontrack']: fl.append(f"{lk}/{r}: non-tracking")
+        lag = 'n/a (does not track)' if c['lag_samples'] is None else str(c['lag_samples'])
+        L.append(f"| {e} | {c['us_per_step']:.0f} | {c['ratio']:.2f}× | {lag} | {c['nominal_latency'] if c['nominal_latency'] is not None else '–'} | {'; '.join(fl) if fl else '–'} |")
+    return L + ["\n*Cost ratios reflect this vectorised-numpy implementation (Python-loop overhead dominates small filters); they are not asymptotic FLOP counts. Measured lag = cross-correlation lag of Ω̂ vs Ω on a dynamic mild run (grid step 10 samples).*\n"]
 
-    # Step 4: plots
-    if HAVE_MPL:
-        print(f"\n{'='*78}\nStep 4: Plotting 1D sweeps\n{'='*78}")
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+def table_sweep(sw, key, title, xname):
+    d = sw[key]; L = [f"### {title}\n", f"| estimator | " + " | ".join(f"{xname}={l:g}" for l in d['levels']) + " |", "|---|" + "---|" * len(d['levels'])]
+    for e in ORDER: L.append(f"| {e} | " + " | ".join(f"{v:.3f}" for v in d['res'][e]) + " |")
+    L.append("| *no-skill MAE (rad/s)* | " + " | ".join(f"{v:.4f}" for v in d['ns']) + " |"); return L + [""]
 
-        sweep_specs = [
-            (axes[0], 'ARW sweep',       arw_values,    sweep_a,
-             'ARW level (rad/√s)', True),
-            (axes[1], 'Contamination sweep', contam_values, sweep_b,
-             'Contamination fraction', False),
-            (axes[2], 'Temperature sweep', temp_values,  sweep_c,
-             'Temperature amplitude (K)', False),
-        ]
+# ------------------------------------------------------------------ findings
+def findings(evs, tuneds, sw, costs):
+    F = []; n = 0
+    def add(s):
+        nonlocal n; n += 1; F.append(f"{n}. {s}")
+    for lk, ev in evs.items():
+        parts = []
+        for r in REGS:
+            w, tied = winner(ev, r); parts.append(f"{r}: {w} ({stat(ev, r, w)['mean']:.3f}; tied/within 5%: {', '.join(tied) if tied else 'none'})")
+        add(f"**Winners, {LABEL[lk]}** — " + "; ".join(parts) + ".")
+    for lk, ev in evs.items():
+        allc = [e for e in ORDER if all(stat(ev, r, e)['collapsed'] for r in REGS)]
+        somec = [e for e in ORDER if any(stat(ev, r, e)['collapsed'] for r in REGS) and e not in allc]
+        nt = [e for e in ORDER if all(stat(ev, r, e)['nontrack'] and not stat(ev, r, e)['collapsed'] for r in REGS)]
+        tr = [e for e in ORDER if all(stat(ev, r, e)['corr'] > 0.9 for r in REGS)]
+        add(f"**Collapse / tracking, {LABEL[lk]}** — collapsed in all regimes: {', '.join(allc) or 'none'}; collapsed in some: {', '.join(somec) or 'none'}; non-tracking (corr<0.3) in all regimes: {', '.join(nt) or 'none'}; tracking (corr>0.9 in every regime): {', '.join(tr) or 'none'}.")
+    for lk, ev in evs.items():
+        rows = []
+        for r in REGS:
+            e = stat(ev, r, 'EKF')['mean']; others = [x for x in ORDER if x not in ('EKF', 'UKF') and not stat(ev, r, x)['collapsed']]
+            b = min(others, key=lambda x: stat(ev, r, x)['mean']); bm = stat(ev, r, b)['mean']
+            rows.append(f"{r}: EKF {e:.3f} vs best non-EKF/UKF {b} {bm:.3f} ({(bm/e-1)*100:+.0f}%)")
+        add(f"**EKF margin, {LABEL[lk]}** — " + "; ".join(rows) + ".")
+    if 'mild' in evs and costs:
+        ev = evs['mild']; fr = []
+        for r in REGS:
+            pts = [(costs[e]['ratio'], stat(ev, r, e)['mean'], e) for e in ORDER if not stat(ev, r, e)['collapsed']]
+            fr.append(f"{r}: " + " → ".join(frontier(pts)))
+        add("**Pareto frontier (cost ascending → accuracy improving), mild** — " + "; ".join(fr) + f". EKF costs {costs['EKF']['ratio']:.1f}× KF, UKF {costs['UKF']['ratio']:.1f}×, SGD {costs['SGD (author)']['ratio']:.1f}×, RLS {costs['RLS']['ratio']:.1f}×.")
+    if sw:
+        g = sw['glitch']; i0 = g['levels'].index(0.0); i2 = len(g['levels']) - 1
+        rat = {e: g['res'][e][i2] / max(g['res'][e][i0], 1e-9) for e in ORDER}
+        trk = [e for e in ORDER if g['corr'][e][i0] > 0.5]; notrk = [e for e in ORDER if e not in trk]
+        rob = [e for e in trk if rat[e] < 1.5]; bad = [e for e in trk if rat[e] > 3]
+        add(f"**Glitches (mild static, {g['levels'][i2]*100:g}% corrupted I/Q)** — error ratio vs clean: robust (<1.5×): {', '.join(f'{e} {rat[e]:.1f}×' for e in rob) or 'none'}; degrade >3×: {', '.join(f'{e} {rat[e]:.1f}×' for e in bad) or 'none'}. Excluded (corr<0.5 even when clean, so a ratio is meaningless): {', '.join(notrk) or 'none'}.")
+        d = sw['dither']; lv = d['levels']; i50 = lv.index(50) if 50 in lv else 0; i200 = lv.index(200) if 200 in lv else 2; i1000 = len(lv) - 1
+        weak = {e: d['res'][e][i50] / max(d['res'][e][i200], 1e-9) for e in ORDER}
+        trk2 = [e for e in ORDER if d['corr'][e][i200] > 0.5]
+        wk = [e for e in trk2 if weak[e] > 2]; ok = [e for e in trk2 if weak[e] <= 1.25]
+        add(f"**Dither dependence (A/ΩL = {lv[i50]} vs {lv[i200]}, mild static)** — need a strong dither (error >2× worse at {lv[i50]}): {', '.join(f'{e} {weak[e]:.1f}×' for e in wk) or 'none'}; insensitive (≤1.25×): {', '.join(ok) or 'none'}. Error at A/ΩL={lv[i1000]}: " + ", ".join(f"{e} {d['res'][e][i1000]:.3f}" for e in ('EKF', 'SGD (author)', 'KF', 'LP readout')) + ".")
+    for lk, ev in evs.items():
+        wf = [100 * np.mean(ev[r]['Huber KF']['w_frac']) for r in REGS]
+        add(f"**Huber, {LABEL[lk]}** — robust weighting engaged on {', '.join(f'{r} {w:.2f}%' for r, w in zip(REGS, wf))} of updates (threshold {tuneds[lk]['Huber KF']['params']['huber']:g}); " + ("in at least one regime this is <1%, so Huber ≡ KF there and was not meaningfully tested on clean data." if min(wf) < 1 else "robust weighting engaged in all clean regimes."))
+    fd = [e for e in ('Zero-crossing', 'FFT-peak')]
+    for lk, ev in evs.items():
+        add(f"**Frequency-domain estimators, {LABEL[lk]}** — " + "; ".join(f"{e}: " + ", ".join(f"{r} {stat(ev, r, e)['mean']:.3f} (r={stat(ev, r, e)['corr']:+.2f}{', collapsed' if stat(ev, r, e)['collapsed'] else ''})" for r in REGS) for e in fd) + ". (Normalised error 1.0 = no skill.) These see only |ψ̇| from S; see the caveat on the Ω̂ conversion.")
+    return F
 
-        for ax, title, xs, res, xlabel, logx in sweep_specs:
-            for est in ESTIMATORS:
-                color, marker = PALETTE[est]
-                ax.plot(xs, res[est], color=color, marker=marker,
-                        label=est, lw=1.8, markersize=7,
-                        markeredgecolor='black', markeredgewidth=0.5)
-            if logx:
-                ax.set_xscale('log')
-            ax.set_xlabel(xlabel, fontsize=10)
-            ax.set_ylabel('Mean |Ω̂ − Ω| (rad/s)', fontsize=10)
-            ax.set_title(title, fontsize=11, fontweight='bold')
-            ax.grid(True, alpha=0.3, which='both')
+CAVEATS = [
+    "Sensor model follows the paper methodology exactly (Omega + probe + OU bias + rate random walk - OmegaL sin(psi+phi_bs) + ARW; I/Q + dither pickoff). Scale-factor, temperature and I/Q-imbalance terms are disabled by default (RLG_MODEL=extended re-enables them) and were not part of the tested results.",
+    "16 units per seed give 7x16=112 paired observations, but units within a seed share Omega, OmegaL events and the seed; seed-level (n=7) CIs and p7 are the conservative primary statistics, p112 is reported for comparison with the paper text.",
+    "The Shi et al. 2026 figures (EKF 1.057 mHz, UKF 1.182 mHz, 150,802 samples) are as supplied and not verified here; no real record was available, so Table 9 is a UKF/EKF ratio comparison only, not validation.",
+    "Normalised units; the simulator is physically structured but not calibrated to a specific gyro. Results support relative-behaviour claims in this model, not absolute hardware claims.",
+    "Frequency-domain estimators recover only |ψ̇| from S; Ω̂ = 2π f̂ − mean|d| is the only physically defined conversion and is exact only if ψ̇ never reverses. Their FFT band is derived from the dither spec, not Shi's 15–25 Hz.",
+    "KF-biexp / SGD-biexp use the simulator's true thermal time constants (τ = 5, 50 s) — an oracle advantage — and their lock-in components are individually unidentifiable (only the sum is observed). SGD-biexp is a leaky integrator with ~3× effective gain, not a clean bi-exponential model.",
+    "Parameters are tuned once per lock-in configuration on pooled training seeds across regimes (not per regime); UKF reuses EKF noise settings; model-based filters are given the sensor noise spec and nominal ΩL as priors.",
+    "Cost = wall-clock of a vectorised numpy implementation (16 units); latency is measured on one dynamic run. Sweeps use 3 seeds; main tables use 7. Dither sweep varies ΩL at fixed A to avoid aliasing at 100 Hz sampling.",
+    "Track C's literature references (SVM 2014, GPR 2024, XGBoost 2026) are as supplied and not independently verified here.",
+]
 
-        # legend on first panel only (frees space)
-        handles, labels = axes[0].get_legend_handles_labels()
-        fig.legend(handles, labels, loc='lower center',
-                   ncol=5, fontsize=9, frameon=True,
-                   bbox_to_anchor=(0.5, -0.06))
+# ------------------------------------------------------------------- figures
+def figures(evs, costs, sw):
+    try:
+        import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
+    except Exception as ex:
+        log(f"figures skipped: {ex}"); return
+    col = dict(Kalman='tab:blue', Gradient='tab:red', **{'Fixed-gain': 'tab:green'}, Phase='tab:purple', Frequency='tab:orange')
+    if costs and evs:
+        lks = list(evs); fig, ax = plt.subplots(len(lks), len(REGS), figsize=(5.2 * len(REGS), 4.4 * len(lks)), squeeze=False)
+        for i, lk in enumerate(lks):
+            for j, r in enumerate(REGS):
+                a = ax[i][j]; pts = []
+                for e in ORDER:
+                    s = stat(evs[lk], r, e); x = costs[e]['ratio']
+                    a.scatter(x, s['mean'], c=('white' if s['collapsed'] else col[FAM[e]]), edgecolors=col[FAM[e]], s=55, zorder=3)
+                    a.annotate(e, (x, s['mean']), fontsize=6, xytext=(3, 3), textcoords='offset points')
+                    if not s['collapsed']: pts.append((x, s['mean'], e))
+                fr = frontier(pts); fx = [costs[n]['ratio'] for n in fr]; fy = [stat(evs[lk], r, n)['mean'] for n in fr]
+                a.step(fx, fy, where='post', c='k', lw=1, zorder=2); a.set_xscale('log'); a.set_yscale('log')
+                a.axhline(1.0, c='gray', ls=':', lw=1)
+                a.set_title(f"{r} — {LABEL[lk]}", fontsize=9); a.set_xlabel('cost ratio vs KF'); a.set_ylabel('normalised error'); a.grid(alpha=.3, which='both')
+        fig.tight_layout(); fig.savefig(f"{OUT}/pareto_frontier.png", dpi=130); plt.close(fig)
+    if sw:
+        fig, ax = plt.subplots(1, 2, figsize=(14, 5))
+        for a, (key, xl) in zip(ax, (('glitch', 'fraction of corrupted I/Q samples'), ('dither', 'dither ratio A/ΩL'))):
+            d = sw[key]; xs = [max(l, 1e-4) if key == 'glitch' else l for l in d['levels']]
+            for e in ORDER: a.plot(xs, d['res'][e], marker='o', ms=4, lw=1.2, c=col[FAM[e]], alpha=.85, ls=['-', '--', ':', '-.'][ORDER.index(e) % 4], label=e)
+            a.axhline(1.0, c='k', ls='--', lw=1, label='no skill'); a.set_yscale('log'); a.set_xscale('log'); a.set_xlabel(xl + (' (0 plotted at 1e-4)' if key == 'glitch' else ''))
+            a.set_ylabel('normalised error (1.0 = no skill)'); a.grid(alpha=.3, which='both')
+        ax[0].legend(fontsize=6, ncol=2); fig.tight_layout(); fig.savefig(f"{OUT}/sweeps_combined.png", dpi=130); plt.close(fig)
 
-        fig.suptitle(
-            '1D sensitivity: how each error source changes estimator error '
-            f'({len(ESTIMATORS)} estimators)\n'
-            'Parameters tuned on realistic_full, held fixed across sweeps',
-            fontsize=12, y=1.02)
-        fig.tight_layout()
-        fig.savefig('sweep_1d.pdf', bbox_inches='tight')
-        fig.savefig('sweep_1d.png', dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        print("  saved sweep_1d.pdf/.png")
+# -------------------------------------------------------------------- report
 
-    # Summary
-    print(f"\n{'='*78}")
-    print(f"Total wall clock: {time.time()-t_start:.1f}s")
-    print("=" * 78)
-    print("\nNotes for the paper:")
-    print("  - 10 estimators spanning 4 families (Kalman, gradient, signal-proc, fixed-gain)")
-    print("  - Full RLG error budget: ARW + bias instability + RRW + SF nonlinearity + temperature")
-    print("  - 1D sweeps hold tuned params fixed (sensitivity, not best-case response)")
-    print("  - AR(2) and I/Q+OLS operate on different layers of the signal chain")
-    print("    (documented in the paper; not equivalent to recursive state estimators)")
+USAGE = """RLG estimator benchmark v16 (paper methodology), Track A: lock-in rate estimation.
+Script:    python3 rlg_bench_v16_single.py {selftest|describe|tune|eval|sweeps|costs|report|show|all} [mild|harsh] [--resume]
+Notebook:  main(['show'])      -> EVERYTHING in one document: setup, run registry, results, cross-run comparison, findings\n           main(['describe'])  -> only the setup table (Table 0)
+           main(['selftest'])  -> correctness checks (~1 min)
+           main(['all', '--resume'])  -> full run (~1 h on 1 core); tables are displayed when it finishes and saved in ./results
+Env: RLG_SMOKE=1 (tiny budget for testing), RLG_OUT=<dir> (default ./results), RLG_MODEL=extended (optional extra realism)"""
+
+def show_text(text):
+    """Render markdown tables in a notebook; print plain text elsewhere."""
+    try:
+        if 'ipykernel' in sys.modules or 'get_ipython' in globals():
+            from IPython.display import display, Markdown
+            display(Markdown(text)); return
+    except Exception: pass
+    print(text)
+
+GRID_DESC = {
+ 'KF': 'q_psi in {1e-4,1e-3,1e-2,1e-1,1} x q_om in {1e-9,1e-8,1e-7,1e-6}  (5x4)',
+ 'Huber KF': 'threshold in {1,1.345,2,3,5,8,15,25,50,100}; q_psi,q_om taken from KF',
+ 'EKF': 'stage 1: q_psi in {1e-5..1e-1} x q_om in {1e-6..1e-3} (5x4), q_L=1e-4; stage 2: q_L in {1e-6,1e-5,1e-4,1e-3}',
+ 'UKF': 'none: reuses EKF noise settings (same model)',
+ 'KF-reg': 'q in {1e-8..1e-4} x r_mult in {0.01,0.1,1,10}  (5x4); q_o = q_l = q',
+ 'KF-biexp': 'q in {1e-9..1e-5} x r_mult in {0.1,0.3,1,3}  (5x4); tau_f=5, tau_s=50 fixed (oracle)',
+ 'SGD (author)': 'k_i in {3e-4,1e-3,3e-3,1e-2,3e-2} x lr in {3e-4,1e-3,3e-3,1e-2}  (5x4)',
+ 'SGD-biexp': 'k_i in {3e-4,1e-3,3e-3,1e-2,3e-2} x lr in {3e-4,1e-3,3e-3,1e-2}  (5x4); tau_f=5, tau_s=50 fixed (oracle)',
+ 'RLS': 'lambda in {0.99,0.995,0.999,0.9999}  (4)',
+ 'alpha-beta': 'alpha in {.005,.01,.02,.05,.1} x ratio in {.03,.1,.3,1}  (5x4)',
+ 'Complementary': 'alpha in {3e-4,1e-3,3e-3,1e-2}  (4)',
+ 'PLL': 'alpha in {.005,.01,.02,.05,.1} x ratio in {.03,.1,.3,1}  (5x4)',
+ 'LP readout': 'alpha in {1e-4,3e-4,1e-3,3e-3}  (4)',
+ 'Zero-crossing': 'window in {50,100,200,400}  (4)',
+ 'FFT-peak': 'window in {100,200,300,500,1000} x hop in {5,10,20}  (15)'}
+OBS = {
+ 'KF': ('wrapped phase atan2(Q,I) + dither input', 'linear [psi, Omega]; lock-in term unmodelled'),
+ 'Huber KF': ('wrapped phase + dither input', 'KF with one-step Huber reweighting of R'),
+ 'EKF': ('I/Q directly + dither input', '[psi, Omega, OmegaL]; nonlinear lock-in dynamics'),
+ 'UKF': ('I/Q directly + dither input', 'same model as EKF, unscented transform'),
+ 'KF-biexp': ('differenced phase Y', '4-state regression [Omega, OmegaL, fast, slow modes]; oracle tau'),
+ 'KF-reg': ('differenced phase Y', 'regression y = Omega - OmegaL sin(psi); parameters random walk'),
+ 'SGD (author)': ('differenced phase Y', 'gradient observer; adapts OmegaL online'),
+ 'SGD-biexp': ('differenced phase Y', 'leaky-integrator extension (~3x gain); oracle tau'),
+ 'RLS': ('differenced phase Y', 'recursive least squares, forgetting factor'),
+ 'alpha-beta': ('wrapped phase + dither input', '2-state tracker; lock-in unmodelled'),
+ 'Complementary': ('differenced phase Y', 'lock-in compensated with the NOMINAL OmegaL (fixed)'),
+ 'PLL': ('I/Q via sin() phase detector + dither input', 'type-II loop; lock-in unmodelled'),
+ 'LP readout': ('differenced phase Y', 'none: conventional counting readout, low-passed'),
+ 'Zero-crossing': ('S = sin(psi) only (+ |dither| removal)', 'none: sign-change count in a window'),
+ 'FFT-peak': ('S = sin(psi) only (+ |dither| removal)', 'none: windowed FFT peak, parabolic interpolation')}
+
+def table_setup(tuneds=None):
+    c = A.CFG; b = c['base']; S = A.SEEDS; tuneds = tuneds or {}
+    variant = 'EXTENDED (extra SF / temperature / IQ-imbalance terms)' if os.environ.get('RLG_MODEL') == 'extended' else 'paper-exact (no scale-factor, temperature or IQ-imbalance terms)'
+    L = ["## Table 0 — What was used (setup, protocol, estimators)\n", "### 0a. Simulation and protocol\n", "| item | value |", "|---|---|"]
+    rows = [
+     ("Sensor model", "psi_dot = Omega(t) + probe(t) + b(t) + r(t) - OmegaL(t) sin(psi + phi_bs) + eta(t)"),
+     ("Model variant", variant),
+     ("What estimators receive", f"I = cos psi + noise, Q = sin psi + noise (sigma = {b['sig_q']} each); dither pickoff = probe + noise (sigma = {b['dither_sig']}). Never the true rate, lock-in rate or phase"),
+     ("Probe (dither)", f"A sin(w t), A = {b['dither_A']} rad/s, w = pi rad/s (period 2 s)"),
+     ("Bias b(t)", f"Ornstein-Uhlenbeck, std {b['bias_inst']}, tau {b['bias_tau']} s"),
+     ("Rate random walk r(t)", f"{b['rrw']} rad/s per sqrt(s)"),
+     ("Angle random walk eta(t)", f"{b['arw']} rad per sqrt(s)"),
+     ("Backscatter phase phi_bs", f"unmodelled, uniform(-{b['eps_max']}, +{b['eps_max']}) rad, fixed per unit"),
+     ("Time base", f"dt = {A.DT} s, T = {A.T:g} s ({int(round(A.T/A.DT))} samples); score window = after 20% burn-in"),
+     ("Units (independent noise realisations) per seed", f"{A.R_UNITS}"),
+     ("Train seeds (tuning only)", f"{A.TRAIN}"),
+     ("Test seeds (all reported tables)", f"{A.TEST}  ->  {len(A.TEST)} x {A.R_UNITS} = {len(A.TEST) * A.R_UNITS} paired observations per estimator"),
+     ("Sweep seeds", f"{A.SWEEP}"),
+     ("Tuning protocol", "per estimator and per lock-in config: grid search on train seeds, objective = mean normalised error pooled over the 3 regimes x train seeds, then frozen; best value on a grid edge -> edge extended and retuned, up to 3 rounds; still on an edge -> reported grid-limited"),
+     ("Normalised error", "MAE / MAE of the no-skill mean predictor (predict mean of true Omega); 1.0 = no skill"),
+     ("Confidence intervals", f"95% Student-t over {len(A.TEST)} test-seed means (primary); paired tests vs EKF: p7 over seeds, p112 over all unit pairs"),
+     ("Collapse diagnostic", "std(Omega_hat) < 0.1 x std(Omega_true) -> COLLAPSED (excluded from ranking); corr(Omega_hat, Omega) < 0.3 -> flagged non-tracking")]
+    for k, v in rows: L.append(f"| {k} | {v} |")
+    L += ["", "### 0b. Lock-in configurations and regimes\n", "| config | OmegaL | OmegaL/A |", "|---|---|---|"]
+    for k, v in c['lockin'].items(): L.append(f"| {k} | {v['oml0']} | 1/{round(b['dither_A'] / v['oml0'])} |")
+    L += ["", "| regime | true Omega(t) | OmegaL(t) |", "|---|---|---|",
+          "| static | slow sinusoid 0.3 + 0.1 sin(2 pi t/100) | piecewise: x1 until t=60 s, x2 after |",
+          "| dynamic | steps + ramps + impulse on top of the sinusoid (t = 60-160 s) | piecewise constant |",
+          "| thermal | slow sinusoid | bi-exponential relaxation from t=30 s: 1 + 0.4 e^(-t/5) + 0.1 e^(-t/50) |", "",
+          "### 0c. Stress sweeps (mild config, static regime, tuned parameters frozen)\n", "| sweep | levels |", "|---|---|",
+          f"| glitch contamination (fraction of corrupted I/Q samples) | {', '.join(f'{100*g:g}%' for g in c['sweeps']['glitch'])} |",
+          f"| dither ratio A/OmegaL (OmegaL varied at fixed A) | {', '.join(str(r) for r in c['sweeps']['dither_ratio'])} |", "",
+          "### 0d. Estimators: what each sees, what it assumes, tuning grid, tuned values\n",
+          "| # | estimator | family | observation used | model assumed | tuning grid (initial) | tuned: mild | tuned: harsh |", "|---|---|---|---|---|---|---|---|"]
+    fmt = lambda t: ", ".join(f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}" for k, v in t['params'].items()) + (" [grid-limited]" if t['edge'] else "")
+    for i, e in enumerate(ORDER, 1):
+        tm = fmt(tuneds['mild'][e]) if 'mild' in tuneds else '-'; th = fmt(tuneds['harsh'][e]) if 'harsh' in tuneds else '-'
+        L.append(f"| {i} | {e} | {FAM[e]} | {OBS[e][0]} | {OBS[e][1]} | {GRID_DESC[e]} | {tm} | {th} |")
+    return L + [""]
+
+def describe():
+    tuneds = {lk: load(f"tuned_{lk}.json") for lk in A.LOCKIN}; tuneds = {k: v for k, v in tuneds.items() if v}
+    show_text("\n".join(table_setup(tuneds)))
+
+# ------------------------------------------------------------------ runs registry and cross-run comparison
+RUN_ROWS = [
+ ("v12", "original file", "oracle observable Y = Omega - OmegaL sin(psi) (no measurement noise); S = sin(psi) exact", "16 / 3 train, 7 test", "10 (incl. AR(2), I/Q+OLS)", "single scenario 'realistic_full'; contamination hit the phase noise, not the measurement", "numbers transcribed from the run output in this conversation; no-skill = mean-Omega predictor (0.0586 rad/s)"),
+ ("v13", "your v13 file", "oracle-form Y plus measurement noise (sigma 0.3, R matched), backscatter 0.05, scale factor; per-regime tuning", "16 / 3 train, 7 test", "10 (adds KF-biexp, SGD-biexp)", "3 regimes; hard-coded findings text contradicted the data (EKF won all three)", "numbers transcribed from the run output; only 6 estimators were reported; no-skill = mean-Omega predictor"),
+ ("v14", "first quadrature rebuild", "I/Q + dither pickoff (no oracle Y); lock-in harsh only (1/40); extras: scale factor, temperature, IQ imbalance, per-unit OmegaL spread", "8 / 2 train, 7 test", "10", "pooled tuning; mild run was killed and never finished; dither amplitude and pickoff-calibration bugs found and fixed during this run", "eval.json from the finished run; normalised here by the stored no-skill error"),
+ ("v15", "four-track spec", "same quadrature model as v14, mild AND harsh, extras on", "8 / 3 train, 7 test", "15 (adds KF-biexp, SGD-biexp, Complementary, zero-crossing, FFT-peak)", "automatic grid expansion; Huber/collapse diagnostics; originally normalised by mean|Omega|", "eval_*.json from the finished runs; converted here to the no-skill ratio"),
+ ("v16", "paper methodology", "paper-exact sensor model (no scale factor / temperature / IQ imbalance), I/Q + dither pickoff, mild AND harsh", "16 / 3 train, 7 test (7x16 = 112 pairs)", "15", "matched 5x4 grids; MAE/no-skill normalisation; p7 and p112 paired tests; Table 9 ratio anchor", "THIS REPORT: local run if present, otherwise the embedded reference run (same code and seeds)")]
+
+def table_runs():
+    L = ["## Table R — Runs compared in this report\n", "| run | what it was | observation / sensor model | units / seeds | estimators | protocol notes | data source |", "|---|---|---|---|---|---|---|"]
+    for r in RUN_ROWS: L.append("| " + " | ".join(r) + " |")
+    return L + ["", "*Runs differ in sensor model, units, regime definitions (v14/v15 static had no OmegaL step; v14 dynamic had one) and normalisation; every cross-run table below uses one common metric, MAE / MAE(no-skill mean predictor), and is directional, not like-for-like.*\n"]
+
+def cells_of(run, lk, evs):
+    if run == 'v16':
+        ev = evs.get(lk)
+        return None if not ev else {reg: {e: [float(np.mean(ev[reg][e]['norm'])), float(np.mean(ev[reg][e]['corr']))] for e in ORDER} for reg in REGS}
+    return ARCHIVE.get(run, {}).get(lk)
+
+def table_compare(evs):
+    L = ["## Table 10 — Cross-run comparison (normalised error = MAE / MAE(no-skill mean predictor); 1.0 = no skill; * = non-tracking, corr < 0.3 where known)\n"]
+    def one(title, lk, runs):
+        data = {r: cells_of(r, lk, evs) for r in runs}; runs = [r for r in runs if data[r]]
+        if len(runs) < 1: return []
+        hdr = [f"{reg[:4]} {r}" for reg in REGS for r in runs]
+        out = [f"### {title}\n", "| estimator | " + " | ".join(hdr) + " |", "|---|" + "---|" * len(hdr)]
+        for e in ORDER:
+            cs = []
+            for reg in REGS:
+                for r in runs:
+                    v = data[r].get(reg, {}).get(e)
+                    cs.append('–' if v is None else f"{v[0]:.3f}" + ('*' if v[1] is not None and v[1] < 0.3 else ''))
+            out.append(f"| {e} | " + " | ".join(cs) + " |")
+        return out + [""]
+    L += one("10a. Harsh lock-in (OmegaL/A = 1/40) across runs v14 / v15 / v16", 'harsh', ['v14', 'v15', 'v16'])
+    L += one("10b. Mild lock-in (OmegaL/A = 1/200) across runs v15 / v16 (v14 mild never finished)", 'mild', ['v15', 'v16'])
+    leg = {'v12': ARCHIVE['v12']['legacy'], 'v13': ARCHIVE['v13']['legacy']}
+    cols = [('v12', 'realistic_full'), ('v13', 'static'), ('v13', 'dynamic'), ('v13', 'thermal')]
+    ests = []
+    for r, reg in cols:
+        for e in leg[r][reg]:
+            if e not in ests: ests.append(e)
+    L += ["### 10c. Older oracle-observable runs (v12, v13) — transcribed, no-skill = mean-Omega predictor\n", "| estimator | " + " | ".join(f"{r} {reg}" for r, reg in cols) + " |", "|---|" + "---|" * len(cols)]
+    for e in ests: L.append(f"| {e} | " + " | ".join(('–' if e not in leg[r][reg] else f"{leg[r][reg][e][0]:.3f}") for r, reg in cols) + " |")
+    L.append("")
+    # key quantities per run
+    rows = [('v12', 'legacy'), ('v13', 'legacy'), ('v14', 'harsh'), ('v15', 'mild'), ('v15', 'harsh'), ('v16', 'mild'), ('v16', 'harsh')]
+    L += ["### 10d. Key quantities per run: winner (error) · SGD(author)/KF error ratio · EKF margin over best non-EKF/UKF\n", "| run / config | " + " | ".join(REGS) + " |", "|---|" + "---|" * len(REGS)]
+    keyq = {}
+    for run, lk in rows:
+        cells = cells_of(run, lk, evs)
+        if not cells: continue
+        row = []
+        for j, reg in enumerate(REGS):
+            rg = 'realistic_full' if (run == 'v12' and j == 0) else reg
+            vals = cells.get(rg)
+            if not vals: row.append('–'); continue
+            n = {e: v[0] for e, v in vals.items()}; w = min(n, key=n.get); parts = [f"{w} {n[w]:.3f}"]
+            sk = n['SGD (author)'] / n['KF'] if ('SGD (author)' in n and 'KF' in n) else None
+            if sk is not None: parts.append(f"SGD/KF {sk:.2f}")
+            mg = None
+            if 'EKF' in n:
+                oth = [x for x in n if x not in ('EKF', 'UKF')]; b = min(oth, key=n.get); mg = n[b] / n['EKF'] - 1; parts.append(f"EKF margin {mg*100:+.0f}% vs {b}")
+            keyq[(run, lk, reg)] = dict(winner=w, best=n[w], sk=sk, margin=mg); row.append(" · ".join(parts))
+        L.append(f"| {run} {lk} | " + " | ".join(row) + " |")
+    L.append("")
+    # rank stability vs v16
+    L += ["### 10e. Rank stability vs v16 (Spearman correlation of estimators' mean normalised error over the 3 regimes)\n", "| comparison | common estimators | rho (all) | p | rho excluding Zero-crossing and FFT-peak (trivially at the extremes) | p |", "|---|---|---|---|---|---|"]
+    rk = {}
+    for run, lk in (('v14', 'harsh'), ('v15', 'harsh'), ('v15', 'mild')):
+        a = cells_of(run, lk, evs); b = cells_of('v16', lk, evs)
+        if not a or not b: continue
+        com = [e for e in ORDER if all(e in a.get(r, {}) for r in REGS) and all(e in b.get(r, {}) for r in REGS)]
+        if len(com) < 4: continue
+        ma = [np.mean([a[r][e][0] for r in REGS]) for e in com]; mb = [np.mean([b[r][e][0] for r in REGS]) for e in com]
+        rho, p = spearmanr(ma, mb); keep = [i for i, e in enumerate(com) if e not in ('Zero-crossing', 'FFT-peak')]
+        rho2, p2 = spearmanr([ma[i] for i in keep], [mb[i] for i in keep]); rk[(run, lk)] = (rho, len(com), rho2, len(keep))
+        L.append(f"| {run} {lk} vs v16 {lk} | {len(com)} | {rho:+.2f} | {p:.3g} | {rho2:+.2f} (n={len(keep)}) | {p2:.3g} |")
+    return L + [""], keyq, rk
+
+def cross_findings(keyq, rk):
+    F = []
+    ek = [(k, v) for k, v in keyq.items() if v['margin'] is not None]
+    won = [k for k, v in ek if v['winner'] in ('EKF', 'UKF')]; lost = [(k, v['winner']) for k, v in ek if v['winner'] not in ('EKF', 'UKF')]
+    F.append(f"**EKF/UKF across runs** — EKF or UKF has the lowest error in {len(won)} of {len(ek)} (run, config, regime) cells where EKF was run" + (("; exceptions: " + ", ".join(f"{k[0]} {k[1]} {k[2]} → {w}" for k, w in lost)) if lost else "") + ".")
+    byrun = {}
+    for (run, lk, reg), v in keyq.items():
+        if v['sk'] is not None: byrun.setdefault(f"{run} {lk}", []).append(v['sk'])
+    below = [k for k, v in byrun.items() if np.mean(v) < 1]; above = [k for k, v in byrun.items() if np.mean(v) >= 1]
+    F.append("**SGD (author) vs KF across runs** — mean SGD/KF error ratio (below 1 = SGD better): " + "; ".join(f"{k} {np.mean(v):.2f}" for k, v in byrun.items()) + f". SGD is better than KF in: {', '.join(below) or 'none'}; worse in: {', '.join(above) or 'none'}. (In the quadrature runs KF has no lock-in model, which is the main reason; see Tables 5 and 10a.)")
+    best = {}
+    for (run, lk, reg), v in keyq.items(): best.setdefault(f"{run} {lk}", []).append(v['best'])
+    F.append("**Discrimination** — best estimator's normalised error per run (mean over regimes; lower = the benchmark separates skill from no skill): " + "; ".join(f"{k} {np.mean(v):.3f}" for k, v in best.items()) + ".")
+    if rk: F.append("**Rank stability** — Spearman rho of estimator ranks vs v16: " + "; ".join(f"{r} {lk} {rho:+.2f} all, {rho2:+.2f} excluding the two frequency estimators (n={n2})" for (r, lk), (rho, n, rho2, n2) in rk.items()) + ".")
+    return F
+
+def get_results():
+    evs = {lk: load(f"eval_{lk}.json") for lk in A.LOCKIN}; evs = {k: v for k, v in evs.items() if v and len(v) == len(REGS)}
+    if evs:
+        return evs, {lk: load(f"tuned_{lk}.json") for lk in evs}, load('sweeps_mild.json'), load('costs.json'), "LOCAL RUN in " + OUT
+    return REFERENCE['eval'], REFERENCE['tuned'], REFERENCE['sweeps'], REFERENCE['costs'], "EMBEDDED REFERENCE RUN (author's finished run: same code, seeds and settings; run main(['all','--resume']) to reproduce it locally)"
+
+def build_doc(evs, tuneds, sw, costs, src):
+    hdr = f"Test seeds {A.TEST}; train seeds {A.TRAIN}; {A.R_UNITS} units/seed; T={A.T:g}s, dt={A.DT}; score window = after 20% burn-in. Normalised error = MAE / MAE of the no-skill mean predictor (1.0 = no skill). Sensor model: paper-exact (no SF/temperature/IQ-imbalance terms).\n"
+    docs = {}
+    for lk in evs:
+        docs[lk] = [f"# RLG benchmark v16 — {LABEL[lk]}\n", hdr] + table_main(lk, evs[lk]) + table_abs(lk, evs[lk]) + table_collapse(lk, evs[lk]) + table_huber(lk, evs[lk], tuneds[lk], sw if lk == 'mild' else None) + table_tuning(lk, tuneds[lk])
+    C = ["# RLG benchmark v16 — full report: setup, runs, results, cross-run comparison\n", f"**Results source:** {src}\n", hdr] + table_setup(tuneds) + table_runs()
+    for i, lk in enumerate(evs):
+        C.append(f"## Table {i+1} — {LABEL[lk]}" + (" (PRIMARY HEADLINE)" if lk == 'mild' else " (stress test)") + "\n"); C += table_main(lk, evs[lk]); C += table_abs(lk, evs[lk])
+    if costs: C += table_cost(costs, evs)
+    for lk in evs: C += table_huber(lk, evs[lk], tuneds[lk], sw if lk == 'mild' else None)
+    for lk in evs: C += table_collapse(lk, evs[lk])
+    if sw:
+        C += table_sweep(sw, 'glitch', 'Table 6 — Glitch sweep (mild static): normalised error vs fraction of corrupted I/Q samples', 'glitch')
+        C += table_sweep(sw, 'dither', 'Table 7 — Dither sweep (mild static): normalised error vs A/ΩL (ΩL varied at fixed A)', 'A/ΩL')
+    for lk in evs: C += table_tuning(lk, tuneds[lk])
+    C += table_anchor(evs)
+    cmp_lines, keyq, rk = table_compare(evs); C += cmp_lines
+    C += ["## Findings (generated from the numbers above)\n"]
+    F = findings(evs, tuneds, sw, costs); n = len(F)
+    C += F + [f"{n+i+1}. {t}" for i, t in enumerate(cross_findings(keyq, rk))]
+    C += ["", "## Caveats\n"] + [f"- {c}" for c in CAVEATS] + ["- Cross-run comparison (Tables R, 10): runs differ in sensor model, units, seeds and regime definitions; v12/v13 values are transcribed from earlier run outputs and v14/v15 are converted to the common no-skill ratio. Treat it as directional."]
+    return C, docs
+
+def report():
+    evs, tuneds, sw, costs, src = get_results(); C, docs = build_doc(evs, tuneds, sw, costs, src)
+    for lk, L in docs.items(): open(f"{OUT}/results_{lk}.md", 'w').write("\n".join(L))
+    open(f"{OUT}/results_combined.md", 'w').write("\n".join(C)); figures(evs, costs, sw)
+    show_text("\n".join(C))
+
+def show_all():
+    evs, tuneds, sw, costs, src = get_results(); C, _ = build_doc(evs, tuneds, sw, costs, src); show_text("\n".join(C))
+
+
+# ------------------------------------------------------------------ selftest
+IDEAL = dict(oml0=0.0, oml_unit_std=0.0, oml_ou_std=0.0, eps_max=0.0, bias_inst=0.0, rrw=0.0, sf_std=0.0, sf_temp=0.0, temp_amp=0.0,
+             temp_ramp=0.0, temp_oml=0.0, temp_bias=0.0, iq_gain_err=0.0, iq_offset=0.0, iq_quad_err=0.0, dither_sig=0.0,
+             dither_sf_err=0.0, sig_q=0.002, arw=0.0, profile='const', oml_event='none')
+def selftest():
+    log("== A. ideal sensor, no lock-in: model-based/regression estimators must recover Omega=0.3 ==")
+    s = A.simulate(A.cfg_for('mild', 'static', **IDEAL), 5, T_=100.0, R=4); n = len(s['Om']); late = slice(int(.7 * n), n); ests = {}
+    for e in ORDER:
+        p = {'Huber KF': dict(huber=1.5), 'EKF': dict(q_psi=4e-4), 'UKF': dict(q_psi=4e-4), 'KF-reg': dict(r_mult=1.0), 'KF-biexp': dict(r_mult=1.0)}.get(e, {})
+        t0 = time.time(); est = A.run_est(e, p, s); ests[e] = est
+        log(f"  {e:<14} late mean|err| = {np.abs(est[late]-0.3).mean():.4f}  ({time.time()-t0:.1f}s)")
+    log("  EKF vs UKF late |diff| = %.5f" % np.abs(ests['EKF'][late] - ests['UKF'][late]).mean())
+    log("== B. KF consistency (exact linear-Gaussian): NIS should be ~1 ==")
+    c = A.cfg_for('mild', 'static', **IDEAL); c.update(arw=0.03, sig_q=0.02); s = A.simulate(c, 7, T_=200.0, R=8)
+    ctx = dict(s['ctx']); est, ex = A.REGISTRY['KF'][0](s['I'], s['Q'], s['dm'], A.DT, ctx, q_psi=0.03 ** 2, q_om=1e-9, return_extras=True)
+    log("  mean NIS = %.3f" % ex['nis'][2000:].mean())
+    log("== C. frequency-domain estimators on dithered signal (expected: cannot recover signed Omega) ==")
+    s = A.simulate(A.cfg_for('mild', 'static', **IDEAL), 5, T_=100.0, R=4)
+    for e in ('Zero-crossing', 'FFT-peak'):
+        est = A.run_est(e, dict(window=200) if e == 'Zero-crossing' else dict(window=300, hop=10), s)
+        log(f"  {e:<14} late mean = {est[late].mean():+.3f}  std = {est[late].mean(1).std():.3f}  (truth 0.300)")
+
+CMDS = ('selftest', 'describe', 'tune', 'eval', 'sweeps', 'costs', 'report', 'show', 'all')
+def main(argv=None):
+    """CLI / notebook entry.  Script:  python file.py all [--resume].   Notebook:  main(['selftest']) ; main(['all', '--resume'])."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    resume = '--resume' in argv; argv = [a for a in argv if a != '--resume']
+    if not argv or argv[0] not in CMDS:      # e.g. a notebook kernel's own argv (-f kernel.json): show usage, do not crash
+        print(USAGE); print(); show_all(); return
+    cmd = argv[0]; lks = [argv[1]] if len(argv) > 1 and argv[1] in A.LOCKIN else A.LOCKIN
+    have = lambda f: os.path.exists(f"{OUT}/{f}")
+    if cmd == 'selftest': selftest()
+    elif cmd == 'describe': describe()
+    elif cmd == 'show': show_all()
+    elif cmd == 'tune': [A.tune_config(lk, log) for lk in lks]
+    elif cmd == 'eval': [A.eval_config(lk, log) for lk in lks]
+    elif cmd == 'sweeps': A.eval_sweeps('mild', log)
+    elif cmd == 'costs': A.measure_costs('mild', log)
+    elif cmd == 'report': report()
+    elif cmd == 'all':   # mild first (primary headline), then harsh.  --resume skips stages whose output file already exists
+        for lk in ['mild', 'harsh']:
+            if resume and have(f"tuned_{lk}.json"): log(f"[resume] tuned_{lk}.json found - skipping tuning")
+            else: A.tune_config(lk, log)
+            ev = load(f"eval_{lk}.json")
+            if resume and ev and len(ev) == len(REGS): log(f"[resume] eval_{lk}.json complete - skipping evaluation")
+            else: A.eval_config(lk, log)
+            if lk == 'mild':
+                if resume and have('sweeps_mild.json') and len(load('sweeps_mild.json')) == 2: log("[resume] sweeps found - skipping")
+                else: A.eval_sweeps('mild', log)
+                if resume and have('costs.json'): log("[resume] costs.json found - skipping")
+                else: A.measure_costs('mild', log)
+            report()
+
+if __name__ == "__main__": main()
